@@ -124,12 +124,14 @@ class App:
         return Use(name)
 
     def send(self, name: str, /, *args, countdown: float | None = None, eta: dt.datetime | None = None,
-             queue: str | None = None, link=None, **kwargs) -> TaskHandle:
+             queue: str | None = None, link=None, expires: float | dt.datetime | None = None,
+             **kwargs) -> TaskHandle:
         """Enqueue a task by name; if it is registered here its arguments are validated, otherwise they are not."""
         task = self.registry.get(name)
         if task is not None:
-            return task.send(*args, countdown=countdown, eta=eta, queue=queue, link=link, **kwargs)
-        return _enqueue(self, name, queue or self.default_queue, self.max_retries, args, kwargs, countdown, eta, link)
+            return task.send(*args, countdown=countdown, eta=eta, queue=queue, link=link, expires=expires, **kwargs)
+        return _enqueue(self, name, queue or self.default_queue, self.max_retries, args, kwargs, countdown, eta,
+                        link, expires)
 
     def workflow(self, name: str, *, ttl: float = 7 * 86400) -> Workflow:
         """A builder for a DAG of tasks sent as one unit; its state expires ``ttl`` seconds after the last progress."""

@@ -142,7 +142,7 @@ impl Client {
         })
     }
 
-    #[pyo3(signature = (task, queue, payload, content_type, max_retries, eta_ms=None, trace_ctx=None))]
+    #[pyo3(signature = (task, queue, payload, content_type, max_retries, eta_ms=None, trace_ctx=None, expires_ms=None))]
     #[allow(clippy::too_many_arguments)]
     fn enqueue(
         &self,
@@ -154,10 +154,12 @@ impl Client {
         max_retries: u32,
         eta_ms: Option<u64>,
         trace_ctx: Option<String>,
+        expires_ms: Option<u64>,
     ) -> PyResult<String> {
         let mut header = Header::new(task, queue, max_retries, content_type);
         header.eta = eta_ms;
         header.trace_ctx = trace_ctx;
+        header.expires = expires_ms;
         py.detach(|| self.rt.block_on(self.broker.enqueue(&header, &payload))).map_err(rt_err)?;
         Ok(header.id)
     }

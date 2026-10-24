@@ -149,6 +149,17 @@ mod tests {
     }
 
     #[test]
+    fn retry_keeps_the_expires_deadline() {
+        // The retried header is cloned, so `expires` carries over: a retry whose backoff lands past
+        // the deadline is later dropped as expired at claim time (README documents this).
+        let mut h = hdr(0, 3);
+        h.expires = Some(1_234);
+        let a = decide(&h, Outcome::Retry { countdown_ms: Some(0), error: "x".into() },
+                       &RetryPolicy::default(), 1_000, |m| m);
+        assert!(matches!(a, Action::Retry { ref header } if header.expires == Some(1_234)));
+    }
+
+    #[test]
     fn retry_exhausted_goes_dead() {
         let a = decide(&hdr(3, 3), Outcome::Retry { countdown_ms: None, error: "boom".into() },
                        &RetryPolicy::default(), 1_000, |m| m);

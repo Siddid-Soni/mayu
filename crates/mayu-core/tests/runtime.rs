@@ -81,6 +81,37 @@ fn retry_exhausted_dead_letters_and_stores_failure() {
 }
 
 #[test]
+fn expired_task_is_dropped_before_running() {
+    let mem = MemoryBroker::default();
+    let mut h = Header::new("t", "q", 3, "ct");
+    h.expires = Some(now_ms().saturating_sub(1_000)); // deadline already past
+    mem.push(&h, b"p");
+    let rt = start(&mem, cfg(2, 2));
+    // never handed to a worker thread
+    assert!(rt.recv_timeout(Duration::from_millis(500)).is_none());
+    // acked with a stored "task expired" failure, queue drained
+    wait_until(|| mem.pending_len() == 0 && mem.result(&h.id).is_some());
+    let rec = ResultRecord::decode(&mem.result(&h.id).unwrap()).unwrap();
+    assert_eq!(rec.status, "failure");
+    assert!(rec.error.as_deref().unwrap_or("").contains("task expired"), "got {:?}", rec.error);
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn not_yet_expired_task_runs_normally() {
+    let mem = MemoryBroker::default();
+    let mut h = Header::new("t", "q", 3, "ct");
+    h.expires = Some(now_ms() + 60_000); // deadline well in the future
+    mem.push(&h, b"p");
+    let rt = start(&mem, cfg(2, 2));
+    let t = rt.recv_timeout(RECV).expect("task should be delivered");
+    assert_eq!(t.id, h.id);
+    rt.complete(t.token, Outcome::Success { result: None, links: vec![] });
+    wait_until(|| mem.pending_len() == 0);
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
 fn failure_dead_letters() {
     let mem = MemoryBroker::default();
     mem.push(&Header::new("t", "q", 5, "ct"), b"");

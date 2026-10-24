@@ -62,7 +62,7 @@ h.result(timeout=30)   # 5
 
 Configuration comes from constructor arguments, overridden by `MAYU_BROKER`,
 `MAYU_RESULT_TTL` (`0` disables results), `MAYU_DEFAULT_QUEUE`, `MAYU_SERIALIZER`.
-`countdown`, `eta`, `queue` and `link` are reserved option names and cannot be task parameters.
+`countdown`, `eta`, `queue`, `link` and `expires` are reserved option names and cannot be task parameters.
 
 ## Reliability
 
@@ -83,6 +83,27 @@ means the task runs again, never that it is lost. **Write idempotent tasks.**
 
 Chaos test (needs Docker): `.venv/bin/pytest tests/chaos -v`
 (`MAYU_CHAOS_N` / `MAYU_CHAOS_SECONDS` scale it).
+
+## Task expiry
+
+```python
+add.send(2, 3, expires=30)                          # drop if not started within 30 seconds
+add.send(2, 3, expires=some_tz_aware_datetime)      # or an absolute deadline
+```
+
+A task with `expires=` is dropped when a worker claims it after the deadline has passed: it is
+acked without running, settled as `outcome="expired"`, and (when results are enabled) a "task
+expired" failure is stored, so `handle.result()` raises `TaskFailed`. The check is at claim time,
+so a task already claimed into a worker's prefetch buffer still runs. The deadline is `expires`
+seconds from when it is sent, or an absolute timezone-aware `datetime`. The deadline travels in an
+optional envelope field that older workers ignore, so upgrade workers before relying on it.
+
+- **The deadline is absolute and spans retries.** A retry (or a rate-limit deferral) keeps the
+  original `expires`, so a task whose backoff or `countdown` lands after the deadline is dropped as
+  expired on its next claim, and that "task expired" result replaces the error that caused the
+  retry.
+- **Clock skew.** `expires` is set from the sender's clock and checked against the worker's, so
+  keep their clocks in sync (NTP); a worker running behind the sender enforces the deadline late.
 
 ## Time limits
 
@@ -683,7 +704,7 @@ processes listen on 9100–9103, so scrape all four. `MAYU_METRICS_PORT` sets th
 | Metric | Type | Labels |
 |---|---|---|
 | `mayu_tasks_received_total` | counter | `queue`, `task` |
-| `mayu_tasks_settled_total` | counter | `queue`, `task`, `outcome` (`success`, `retry`, `dead`, `cancelled`) |
+| `mayu_tasks_settled_total` | counter | `queue`, `task`, `outcome` (`success`, `retry`, `dead`, `cancelled`, `expired`) |
 | `mayu_task_duration_seconds` | histogram | `queue`, `task` |
 | `mayu_tasks_deferred_total` | counter | `queue`, `task` (rate-limited tasks sent back to Redis) |
 | `mayu_tasks_reclaimed_total` | counter | `queue` (taken over from a dead worker) |

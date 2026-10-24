@@ -24,6 +24,8 @@ pub enum Settled {
     Dead,
     /// Acked without running: the task's workflow was cancelled.
     Cancelled,
+    /// Acked without running: the task's `expires` deadline had passed when it was claimed.
+    Expired,
 }
 
 impl Settled {
@@ -33,6 +35,7 @@ impl Settled {
             Settled::Retry => "retry",
             Settled::Dead => "dead",
             Settled::Cancelled => "cancelled",
+            Settled::Expired => "expired",
         }
     }
 }
@@ -458,9 +461,11 @@ mod tests {
         m.settled("q", "t", Settled::Success, Some(Duration::from_millis(30)));
         m.settled("q", "t", Settled::Dead, Some(Duration::from_secs(2)));
         m.settled("q", "t", Settled::Dead, None); // poison: counted, not timed
+        m.settled("q", "t", Settled::Expired, None); // dropped at claim: counted, not timed
         let b = m.render(&Gauges::default());
         assert_eq!(value(&b, r#"mayu_tasks_settled_total{queue="q",task="t",outcome="success"}"#), Some(1.0));
         assert_eq!(value(&b, r#"mayu_tasks_settled_total{queue="q",task="t",outcome="dead"}"#), Some(2.0));
+        assert_eq!(value(&b, r#"mayu_tasks_settled_total{queue="q",task="t",outcome="expired"}"#), Some(1.0));
         let bucket = |le: &str| value(&b, &format!(r#"mayu_task_duration_seconds_bucket{{queue="q",task="t",le="{le}"}}"#));
         assert_eq!(bucket("0.025"), Some(0.0));
         assert_eq!(bucket("0.05"), Some(1.0));

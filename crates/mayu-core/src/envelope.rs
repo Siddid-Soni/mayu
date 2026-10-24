@@ -23,6 +23,10 @@ pub struct Header {
     /// The node's index in its workflow, as a decimal string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
+    /// Absolute ms deadline. The worker drops the task at claim time if `now_ms()` is past it,
+    /// settling it as `expired`. Absent from an ordinary task's bytes, so older workers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<u64>,
 }
 
 impl Header {
@@ -44,6 +48,7 @@ impl Header {
             content_type: content_type.into(),
             workflow_id: None,
             node: None,
+            expires: None,
         }
     }
 }
@@ -158,11 +163,30 @@ mod tests {
     }
 
     #[test]
+    fn expires_roundtrips_and_old_readers_ignore_it() {
+        let mut h = Header::new("t", "q", 1, "ct");
+        h.expires = Some(1_700_000_000_000);
+        let bytes = encode_header(&h);
+        assert_eq!(decode_header(&bytes).unwrap(), h);
+        // A worker on an older version decodes the same bytes without the field and still sees the task.
+        let old: OldHeader = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(old, old_of(&h));
+    }
+
+    #[test]
+    fn plain_header_without_expires_matches_the_old_bytes() {
+        // expires is skipped when None, so an ordinary task's bytes are unchanged for a rolling deploy.
+        let h = Header::new("app.add", "default", 3, "application/msgpack");
+        assert_eq!(h.expires, None);
+        assert_eq!(encode_header(&h), rmp_serde::to_vec_named(&old_of(&h)).unwrap());
+    }
+
+    #[test]
     fn header_new_defaults() {
         let h = Header::new("t", "q", 5, "ct");
         assert_eq!(h.attempt, 0);
         assert_eq!(h.eta, None);
-        assert_eq!((h.workflow_id, h.node), (None, None));
+        assert_eq!((h.workflow_id, h.node, h.expires), (None, None, None));
         assert_eq!(h.id.len(), 26, "ULID string is 26 chars");
         assert!(h.created_at > 0);
         assert_ne!(Header::new("t", "q", 5, "ct").id, h.id);

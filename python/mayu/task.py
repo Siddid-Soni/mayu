@@ -8,7 +8,7 @@ from . import otel
 from .handle import TaskHandle
 from .pool import Use
 
-RESERVED_OPTIONS = frozenset({"countdown", "eta", "queue", "link"})
+RESERVED_OPTIONS = frozenset({"countdown", "eta", "queue", "link", "expires"})
 
 
 _RATE_UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0}
@@ -125,6 +125,21 @@ def _as_links(link) -> list[Signature]:
     return out
 
 
+def _expires_ms(expires) -> int | None:
+    """Seconds from now, or an absolute timezone-aware datetime, as absolute ms. None stays None."""
+    if expires is None:
+        return None
+    if isinstance(expires, dt.datetime):
+        if expires.tzinfo is None:
+            raise ValueError("expires must be a timezone-aware datetime")
+        return max(0, int(expires.timestamp() * 1000))  # a pre-1970 deadline is already past
+    if isinstance(expires, bool) or not isinstance(expires, (int, float)):
+        raise TypeError(f"expires must be a number of seconds or a datetime, got {type(expires).__name__}")
+    if not math.isfinite(expires):
+        raise ValueError(f"expires must be a finite number of seconds, got {expires!r}")
+    return int(time.time() * 1000) + max(0, int(expires * 1000))
+
+
 def _eta_ms(countdown: float | None, eta: dt.datetime | None) -> int | None:
     if countdown is not None and eta is not None:
         raise ValueError("pass countdown or eta, not both")
@@ -160,9 +175,11 @@ def _find_pools(name: str, sig: inspect.Signature, is_async: bool) -> dict[str, 
     return pools
 
 
-def _enqueue(app, name: str, queue: str, max_retries: int, args, kwargs, countdown, eta, link) -> TaskHandle:
+def _enqueue(app, name: str, queue: str, max_retries: int, args, kwargs, countdown, eta, link,
+             expires=None) -> TaskHandle:
     links = _as_links(link)
     eta_ms = _eta_ms(countdown, eta)
+    expires_ms = _expires_ms(expires)
     serializer = app.serializer
     body = [list(args), kwargs]
     if links:
@@ -171,7 +188,7 @@ def _enqueue(app, name: str, queue: str, max_retries: int, args, kwargs, countdo
     span, traceparent = otel.start_send(name, queue)
     try:
         task_id = app.client.enqueue(name, queue, payload, serializer.content_type, max_retries, eta_ms,
-                                     trace_ctx=traceparent)
+                                     trace_ctx=traceparent, expires_ms=expires_ms)
     except BaseException as e:
         otel.end(span, e)
         raise
@@ -245,11 +262,13 @@ class Task:
         return self
 
     def send(self, *args, countdown: float | None = None, eta: dt.datetime | None = None,
-             queue: str | None = None, link=None, **kwargs) -> TaskHandle:
+             queue: str | None = None, link=None, expires: float | dt.datetime | None = None,
+             **kwargs) -> TaskHandle:
         bound = self.signature.bind(*args, **kwargs)
         if self.pools:
             _reject_pool_arguments(self, bound, self.name)
-        return _enqueue(self.app, self.name, queue or self.queue, self.max_retries, args, kwargs, countdown, eta, link)
+        return _enqueue(self.app, self.name, queue or self.queue, self.max_retries, args, kwargs, countdown, eta,
+                        link, expires)
 
     def s(self, *args, **kwargs) -> Signature:
         """This task with arguments, for ``link=`` (the parent's result comes first) or ``wf.add``."""

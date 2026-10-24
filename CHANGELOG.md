@@ -6,6 +6,10 @@ All notable changes to mayu are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Task expiry: `send(..., expires=30)` (seconds from now, or a timezone-aware `datetime`) drops a task at claim time if no worker started it by the deadline, settling it as `outcome="expired"` in `mayu_tasks_settled_total` and storing a "task expired" failure (when results are enabled). `expires` is now a reserved option name. Opt-in: tasks sent without it behave exactly as before. The deadline rides in a new optional envelope field, so older workers ignore it (they won't enforce expiry); upgrade workers first.
+
 ## [0.2.5] - 2026-10-22
 
 ### Added
