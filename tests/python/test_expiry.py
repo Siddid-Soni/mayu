@@ -44,6 +44,16 @@ def test_expires_ms_rejects_non_finite(bad):
         _expires_ms(bad)
 
 
+@pytest.mark.parametrize("bad", [1e30, 10**30])
+def test_send_rejects_expires_too_far_ahead(app, bad):
+    @app.task
+    def work():
+        return "done"
+
+    with pytest.raises(ValueError, match="too far"):
+        work.send(expires=bad)
+
+
 def test_expires_reserved_as_task_parameter(app):
     with pytest.raises(TypeError, match="reserved"):
         @app.task

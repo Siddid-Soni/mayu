@@ -137,7 +137,10 @@ def _expires_ms(expires) -> int | None:
         raise TypeError(f"expires must be a number of seconds or a datetime, got {type(expires).__name__}")
     if not math.isfinite(expires):
         raise ValueError(f"expires must be a finite number of seconds, got {expires!r}")
-    return int(time.time() * 1000) + max(0, int(expires * 1000))
+    ms = int(time.time() * 1000) + max(0, int(expires * 1000))
+    if ms >= 2**64:  # the envelope stores the deadline as a u64
+        raise ValueError(f"expires is too far in the future, got {expires!r} seconds")
+    return ms
 
 
 def _eta_ms(countdown: float | None, eta: dt.datetime | None) -> int | None:
