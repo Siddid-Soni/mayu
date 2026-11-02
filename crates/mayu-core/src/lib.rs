@@ -12,7 +12,7 @@ pub mod result;
 pub mod runtime;
 pub mod workflow;
 
-pub use broker::{Broker, Delivery, PublishedTasks, QueueStats, Reclaimed, StoredResult, WorkerInfo};
+pub use broker::{Broker, DeadLetter, Delivery, PublishedTasks, QueueStats, Reclaimed, StoredResult, WorkerInfo};
 pub use dispatch::{
     Admit, DEFAULT_STAGE_LEAD, Dispatcher, HOLD_HORIZON, LOOKAHEAD_BACKOFF, LazyPool, LookaheadKind, OLDEST_BONUS,
     PARKED_BONUS_RATIO, RESERVE_AFTER, Resources, STAGE_MARGIN, Schedule, THROUGHPUT_BONUS,

@@ -1,6 +1,8 @@
 import datetime as dt
+import logging
 import os
 import threading
+from typing import TYPE_CHECKING, Any
 
 from . import _native
 from .handle import TaskHandle
@@ -9,8 +11,18 @@ from .serializers import PICKLE, get_serializer
 from .task import Task, _enqueue, check_resources
 from .workflow import Workflow
 
+if TYPE_CHECKING:
+    from .worker import WorkerRunner
+
+log = logging.getLogger("mayu.app")
+
 _TASK_OPTIONS = frozenset({"name", "queue", "max_retries", "retry_on", "soft_time_limit", "hard_time_limit",
                            "threadsafe", "rate_limit", "resources"})
+
+
+def _is_memory_url(url: str) -> bool:
+    """True for an in-process broker URL (``memory://`` or ``memory://<name>``)."""
+    return url[:9].lower() == "memory://"
 
 
 class App:
@@ -34,6 +46,9 @@ class App:
         self._client = None
         self._client_lock = threading.Lock()
         self._registry_lock = threading.Lock()
+        self._embedded = _is_memory_url(self.broker_url)  # producers and workers must share this process
+        if self._embedded:
+            self._client = _native.Client(self.broker_url)  # checks the URL now; connecting costs nothing
 
     @property
     def client(self) -> "_native.Client":
@@ -132,6 +147,30 @@ class App:
             return task.send(*args, countdown=countdown, eta=eta, queue=queue, link=link, expires=expires, **kwargs)
         return _enqueue(self, name, queue or self.default_queue, self.max_retries, args, kwargs, countdown, eta,
                         link, expires)
+
+    def worker(self, *, queues: list[str] | None = None, threads: int | None = None, mode: str = "auto",
+               **options: Any) -> "WorkerRunner":
+        """A worker that runs this app's tasks on threads of this process. Call ``start()``, then ``stop()`` and
+        ``join()``, or use it as a context manager. ``options`` are the ``mayu worker`` settings as keywords, like
+        ``resources={"gpu": 1}`` or ``pool_mode="lazy"``.
+
+        It always runs in thread mode: ``mode="auto"`` picks it even when the GIL is on, and ``mode="process"``
+        raises (run ``mayu worker --mode process`` for that with a Redis broker)."""
+        from .modes import gil_enabled
+        from .worker import WorkerRunner
+
+        if mode not in ("auto", "thread", "process"):
+            raise ValueError(f"mode must be 'auto', 'thread' or 'process', got {mode!r}")
+        if mode == "process":
+            if self._embedded:
+                raise ValueError(f"{self.broker_url} is a broker inside this process, which worker processes can't "
+                                 f"reach; use mode='thread' (the default)")
+            raise ValueError("app.worker() runs tasks on threads of this process; use mode='thread', or run "
+                             "`mayu worker --mode process` for process mode")
+        if gil_enabled():
+            log.warning("the GIL is enabled; threads will not run Python code in parallel. "
+                        "Use a free-threaded build (python3.14t) for parallel tasks.")
+        return WorkerRunner(self, threads=threads or os.cpu_count() or 4, queues=queues, **options)
 
     def workflow(self, name: str, *, ttl: float = 7 * 86400) -> Workflow:
         """A builder for a DAG of tasks sent as one unit; its state expires ``ttl`` seconds after the last progress."""

@@ -99,6 +99,17 @@ scheduling, acks, retries, timers, recovery — lives in Rust.
 Implements `Broker` with Redis Streams + consumer groups. All multi-step state
 transitions are Lua scripts so they are atomic.
 
+### 3.2a In-process broker (`memory://`, embedded mode)
+`mayu-core`'s `MemoryBroker` (an `Arc<Mutex<State>>` plus a `Notify` that wakes blocked fetches) is a faithful
+in-memory model of the Redis driver: the same atomic transitions, each under one lock instead of one Lua script,
+the same dead-letter entry ids and replay, and result, heartbeat and workflow TTLs that expire as the Redis keys
+would (lazily on read, plus a sweep when the map is touched). Besides testing the runtime, it backs embedded mode:
+`mayu-py` holds a `Backend` enum (`Redis(RedisBroker) | Memory(MemoryBroker)`) that implements `Broker` by static
+dispatch, and a `memory://` or `memory://<name>` URL picks a `MemoryBroker` from a process-wide registry keyed by
+name, so a producer `Client` and a thread-mode `Worker` in the same process share its state. Nothing crosses the
+process boundary: `mayu worker`, `inspect` and `dead` refuse such an app, process mode is refused, and queued
+work is lost when the process exits. Other URLs take the Redis path unchanged.
+
 ### 3.3 Python bindings (`mayu-py`, PyO3)
 - Module declared free-threading safe (PyO3 ≥ 0.28 default; no `gil_used`).
 - Exposes the ready queue `recv()` (detaches from the interpreter while

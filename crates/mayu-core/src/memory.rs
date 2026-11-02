@@ -1,12 +1,13 @@
-//! In-process `Broker` used to test the runtime without Redis.
-use std::collections::{HashMap, VecDeque};
+//! In-process `Broker`: a faithful model of `RedisBroker`, used to test the runtime without Redis and by
+//! embedded mode (`memory://`).
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
-use crate::broker::{Broker, Delivery, PublishedTasks, QueueStats, Reclaimed, StoredResult, WorkerInfo};
+use crate::broker::{Broker, DeadLetter, Delivery, PublishedTasks, QueueStats, Reclaimed, StoredResult, WorkerInfo};
 use crate::envelope::{Header, decode_header, encode_header, now_ms};
 use crate::error::{Error, Result};
 use crate::progress::RunningTask;
@@ -51,11 +52,36 @@ struct MemNode {
 struct MemWorkflow {
     name: String,
     created_at: u64,
+    /// Like the Redis hash's TTL: set on submit, refreshed when a node is released or replayed.
+    ttl: Duration,
+    expires: Instant,
     cancelled: bool,
     /// Nodes in state `Done`; `cancel_workflow` is a no-op once it reaches the node count.
     done: usize,
     nodes: Vec<MemNode>,
 }
+
+/// A dead letter as the dead stream holds it.
+struct DeadStored {
+    /// `<ms>-<seq>`, increasing, like a Redis stream id.
+    entry_id: String,
+    id: (u64, u64),
+    queue: String,
+    /// What `dead()` reports: the delivery's header, or `None` for an undecodable entry.
+    header: Option<Header>,
+    raw_header: Vec<u8>,
+    payload: Vec<u8>,
+    error: String,
+}
+
+/// A stored result and when it expires (`None`: never, for `put_result`).
+struct StoredRecord {
+    record: Vec<u8>,
+    expires: Option<Instant>,
+}
+
+/// Results are swept of expired records once the map grows past this, then past twice its live size.
+const RESULT_SWEEP_MIN: usize = 1024;
 
 #[derive(Default)]
 struct State {
@@ -63,21 +89,86 @@ struct State {
     streams: HashMap<String, VecDeque<Entry>>,
     pending: HashMap<String, Pending>,
     delayed: HashMap<String, Vec<DelayedEntry>>,
-    dead: Vec<DeadEntry>,
-    results: HashMap<String, Vec<u8>>,
+    dead: Vec<DeadStored>,
+    /// Queues that have a dead stream; like Redis, it stays after its entries are replayed.
+    dead_queues: HashSet<String>,
+    last_dead_id: (u64, u64),
+    results: HashMap<String, StoredRecord>,
+    results_sweep_at: usize,
     workers: HashMap<String, (WorkerInfo, Instant)>,
     workflows: HashMap<String, MemWorkflow>,
 }
 
+/// Parses a stream id `ms-seq`, or `ms` with `seq` defaulting to `missing_seq` (as Redis completes a range bound).
+fn parse_stream_id(id: &str, missing_seq: u64) -> Result<(u64, u64)> {
+    let bad = || Error::Broker(format!("invalid stream id {id:?}"));
+    let (ms, seq) = match id.split_once('-') {
+        Some((ms, seq)) => (ms, Some(seq)),
+        None => (id, None),
+    };
+    let ms = ms.parse().map_err(|_| bad())?;
+    let seq = seq.map_or(Ok(missing_seq), |s| s.parse().map_err(|_| bad()))?;
+    Ok((ms, seq))
+}
+
 impl State {
+    fn push_dead(&mut self, queue: &str, header: Option<Header>, raw_header: Vec<u8>, payload: Vec<u8>, error: String) {
+        let ms = now_ms();
+        let id = if ms > self.last_dead_id.0 { (ms, 0) } else { (self.last_dead_id.0, self.last_dead_id.1 + 1) };
+        self.last_dead_id = id;
+        self.dead_queues.insert(queue.to_string());
+        self.dead.push(DeadStored {
+            entry_id: format!("{}-{}", id.0, id.1),
+            id,
+            queue: queue.to_string(),
+            header,
+            raw_header,
+            payload,
+            error,
+        });
+    }
+
+    fn store_result(&mut self, r: StoredResult) {
+        let expires = Instant::now() + Duration::from_secs(r.ttl_secs);
+        self.results.insert(r.id, StoredRecord { record: r.record, expires: Some(expires) });
+        if self.results.len() >= self.results_sweep_at.max(RESULT_SWEEP_MIN) {
+            let now = Instant::now();
+            self.results.retain(|_, r| r.expires.is_none_or(|e| e > now));
+            self.results_sweep_at = self.results.len() * 2;
+        }
+    }
+
+    fn result(&mut self, id: &str) -> Option<Vec<u8>> {
+        let live = self.results.get(id)?.expires.is_none_or(|e| e > Instant::now());
+        if !live {
+            self.results.remove(id);
+            return None;
+        }
+        self.results.get(id).map(|r| r.record.clone())
+    }
+
+    /// The workflow, unless it is unknown or its TTL ran out (then it is dropped, as Redis expires the hash).
+    fn workflow_mut(&mut self, id: &str) -> Option<&mut MemWorkflow> {
+        if self.workflows.get(id).is_some_and(|w| w.expires <= Instant::now()) {
+            self.workflows.remove(id);
+        }
+        self.workflows.get_mut(id)
+    }
+
+    fn sweep_workflows(&mut self) {
+        let now = Instant::now();
+        self.workflows.retain(|_, w| w.expires > now);
+    }
+
     fn push_stream(&mut self, queue: &str, h: Vec<u8>, p: Vec<u8>) {
         self.seq += 1;
         let id = format!("{}-0", self.seq);
         self.streams.entry(queue.to_string()).or_default().push_back(Entry { id, h, p });
     }
 
-    fn bury(&mut self, queue: &str, error: String) {
-        self.dead.push(DeadEntry { queue: queue.to_string(), header: None, error });
+    /// Dead-letters an entry whose header can't be decoded.
+    fn bury(&mut self, queue: &str, h: Vec<u8>, p: Vec<u8>, error: String) {
+        self.push_dead(queue, None, h, p, error);
     }
 
     /// Marks node `i` done and enqueues the children it was the last missing parent of. Does
@@ -85,7 +176,7 @@ impl State {
     /// a cancelled workflow it marks the node cancelled instead. False when nothing was enqueued.
     /// An expired (unknown) workflow releases nothing, like `release.lua` finding no hash.
     fn release(&mut self, wf_id: &str, i: usize) -> Result<bool> {
-        let Some(wf) = self.workflows.get_mut(wf_id) else { return Ok(false) };
+        let Some(wf) = self.workflow_mut(wf_id) else { return Ok(false) };
         let Some(state) = wf.nodes.get(i).map(|n| n.state) else {
             return Err(Error::Broker(format!("workflow {wf_id} has no node {i}")));
         };
@@ -94,6 +185,7 @@ impl State {
         }
         if wf.cancelled {
             wf.nodes[i].state = NodeState::Cancelled;
+            wf.expires = Instant::now() + wf.ttl;
             return Ok(false);
         }
         let mut ready = Vec::new();
@@ -109,6 +201,7 @@ impl State {
         }
         wf.nodes[i].state = NodeState::Done;
         wf.done += 1;
+        wf.expires = Instant::now() + wf.ttl;
         let mut out = Vec::new();
         for c in ready {
             let child = &mut wf.nodes[c];
@@ -145,7 +238,7 @@ impl State {
                             count: 1,
                         });
                     }
-                    Err(err) => self.bury(q, err.to_string()),
+                    Err(err) => self.bury(q, e.h, e.p, err.to_string()),
                 }
             }
         }
@@ -240,6 +333,12 @@ impl MemoryBroker {
         self.notify.notify_waiters();
     }
 
+    /// Test aid: appends a stream entry with these raw header bytes, like an `XADD` by another writer.
+    pub fn push_raw(&self, queue: &str, h: Vec<u8>, p: Vec<u8>) {
+        self.state.lock().unwrap().push_stream(queue, h, p);
+        self.notify.notify_waiters();
+    }
+
     pub fn pending_len(&self) -> usize { self.state.lock().unwrap().pending.len() }
     pub fn stream_len(&self, q: &str) -> usize {
         self.state.lock().unwrap().streams.get(q).map_or(0, |s| s.len())
@@ -247,12 +346,16 @@ impl MemoryBroker {
     pub fn delayed_len(&self, q: &str) -> usize {
         self.state.lock().unwrap().delayed.get(q).map_or(0, |d| d.len())
     }
-    pub fn dead(&self) -> Vec<DeadEntry> { self.state.lock().unwrap().dead.clone() }
-    /// Stores a result record directly, as a finished task's ack would.
-    pub fn put_result(&self, id: &str, record: Vec<u8>) {
-        self.state.lock().unwrap().results.insert(id.to_string(), record);
+    pub fn dead(&self) -> Vec<DeadEntry> {
+        let s = self.state.lock().unwrap();
+        s.dead.iter().map(|d| DeadEntry { queue: d.queue.clone(), header: d.header.clone(), error: d.error.clone() })
+            .collect()
     }
-    pub fn result(&self, id: &str) -> Option<Vec<u8>> { self.state.lock().unwrap().results.get(id).cloned() }
+    /// Stores a result record directly, as a finished task's ack would; it never expires.
+    pub fn put_result(&self, id: &str, record: Vec<u8>) {
+        self.state.lock().unwrap().results.insert(id.to_string(), StoredRecord { record, expires: None });
+    }
+    pub fn result(&self, id: &str) -> Option<Vec<u8>> { self.state.lock().unwrap().result(id) }
     pub fn delivery_count(&self, stream_id: &str) -> Option<u64> {
         self.state.lock().unwrap().pending.get(stream_id).map(|p| p.count)
     }
@@ -271,17 +374,149 @@ impl MemoryBroker {
     }
 
     fn store(s: &mut State, r: Option<StoredResult>) {
-        if let Some(r) = r { s.results.insert(r.id, r.record); }
+        if let Some(r) = r { s.store_result(r); }
     }
 
     /// Whether this consumer still holds `d`'s pending entry (not reclaimed by another, not settled).
     fn owns(&self, s: &State, d: &Delivery) -> bool {
         matches!(s.pending.get(&d.stream_id), Some(p) if p.owner == self.consumer)
     }
+
+    // The admin calls `RedisBroker` has besides the `Broker` trait, with the same semantics.
+
+    /// The worker's last heartbeat, if it has not expired.
+    pub async fn worker_info(&self, worker_id: &str) -> Result<Option<WorkerInfo>> {
+        self.check()?;
+        Ok(self.worker(worker_id))
+    }
+
+    /// Workers with a live heartbeat, sorted by id.
+    pub async fn workers(&self) -> Result<Vec<WorkerInfo>> {
+        self.check()?;
+        let now = Instant::now();
+        let s = self.state.lock().unwrap();
+        let mut out: Vec<WorkerInfo> = s.workers.values().filter(|(_, e)| *e > now).map(|(w, _)| w.clone()).collect();
+        out.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
+        Ok(out)
+    }
+
+    /// Dead letters of `queue`, oldest first: strictly after `after`, up to and including `until`.
+    pub async fn dead_letters(&self, queue: &str, after: Option<&str>, until: Option<&str>, count: usize)
+        -> Result<Vec<DeadLetter>>
+    {
+        self.check()?;
+        let after = after.map(|id| parse_stream_id(id, 0)).transpose()?;
+        let until = until.map(|id| parse_stream_id(id, u64::MAX)).transpose()?;
+        let s = self.state.lock().unwrap();
+        Ok(s.dead.iter()
+            .filter(|d| d.queue == queue && after.is_none_or(|a| d.id > a) && until.is_none_or(|u| d.id <= u))
+            .take(count.max(1))
+            .map(|d| DeadLetter {
+                entry_id: d.entry_id.clone(),
+                header: decode_header(&d.raw_header).ok(),
+                raw_header: d.raw_header.clone(),
+                payload: d.payload.clone(),
+                error: d.error.clone(),
+            })
+            .collect())
+    }
+
+    /// Id of the newest dead letter of `queue`.
+    pub async fn last_dead_id(&self, queue: &str) -> Result<Option<String>> {
+        self.check()?;
+        let s = self.state.lock().unwrap();
+        Ok(s.dead.iter().rev().find(|d| d.queue == queue).map(|d| d.entry_id.clone()))
+    }
+
+    /// Moves dead letters back to `queue` to run again (attempt 0, no eta, same task id), deleting
+    /// their stored failure results. Missing or undecodable entries are skipped. Returns how many moved.
+    pub async fn replay_dead(&self, queue: &str, entry_ids: &[String]) -> Result<usize> {
+        self.check()?;
+        let ids = entry_ids.iter().map(|id| parse_stream_id(id, 0)).collect::<Result<Vec<_>>>()?;
+        let moved = {
+            let mut s = self.state.lock().unwrap();
+            let mut moved = 0;
+            for id in ids {
+                let Some(pos) = s.dead.iter().position(|d| d.queue == queue && d.id == id) else { continue };
+                let Ok(mut h) = decode_header(&s.dead[pos].raw_header) else { continue };
+                let payload = s.dead.remove(pos).payload;
+                h.attempt = 0;
+                h.eta = None;
+                s.push_stream(queue, encode_header(&h), payload);
+                s.results.remove(&h.id);
+                moved += 1;
+                let node = h.node.as_deref().and_then(|n| n.parse::<usize>().ok());
+                if let (Some(wf), Some(i)) = (h.workflow_id.as_deref(), node)
+                    && let Some(w) = s.workflow_mut(wf)
+                    && let Some(n) = w.nodes.get_mut(i)
+                    && n.state == NodeState::Dead
+                {
+                    n.state = NodeState::Queued;
+                    w.expires = Instant::now() + w.ttl;
+                }
+            }
+            moved
+        };
+        if moved > 0 {
+            self.notify.notify_waiters();
+        }
+        Ok(moved)
+    }
+
+    /// Workflows that haven't expired, oldest first.
+    pub async fn workflows(&self) -> Result<Vec<WorkflowState>> {
+        self.check()?;
+        let mut s = self.state.lock().unwrap();
+        s.sweep_workflows();
+        let mut out: Vec<WorkflowState> = s.workflows.iter().map(|(id, w)| w.state(id)).collect();
+        out.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        Ok(out)
+    }
+
+    /// Queues that have a stream, delayed entries or a dead stream, sorted.
+    pub async fn known_queues(&self) -> Result<Vec<String>> {
+        self.check()?;
+        let s = self.state.lock().unwrap();
+        let mut qs: Vec<String> = s.streams.keys()
+            .chain(s.delayed.iter().filter(|(_, d)| !d.is_empty()).map(|(q, _)| q))
+            .chain(s.dead_queues.iter())
+            .cloned()
+            .collect();
+        qs.sort();
+        qs.dedup();
+        Ok(qs)
+    }
+}
+
+impl MemWorkflow {
+    fn state(&self, id: &str) -> WorkflowState {
+        WorkflowState {
+            id: id.to_string(),
+            name: self.name.clone(),
+            created_at: self.created_at,
+            cancelled: self.cancelled,
+            nodes: self.nodes.iter().enumerate().map(|(i, n)| NodeInfo {
+                node: i.to_string(),
+                task_id: n.task_id.clone(),
+                task: n.task.clone(),
+                queue: n.queue.clone(),
+                state: n.state,
+                parents: n.parents.clone(),
+            }).collect(),
+        }
+    }
 }
 
 impl Broker for MemoryBroker {
-    async fn ensure_queues(&self, _queues: &[String]) -> Result<()> { self.check() }
+    /// Creates each queue's (empty) stream, as `XGROUP CREATE ... MKSTREAM` does.
+    async fn ensure_queues(&self, queues: &[String]) -> Result<()> {
+        self.check()?;
+        let mut s = self.state.lock().unwrap();
+        for q in queues {
+            s.streams.entry(q.clone()).or_default();
+        }
+        Ok(())
+    }
 
     async fn enqueue(&self, header: &Header, payload: &[u8]) -> Result<()> {
         self.check()?;
@@ -312,8 +547,11 @@ impl Broker for MemoryBroker {
         let wake = {
             let mut s = self.state.lock().unwrap();
             if !self.owns(&s, d) {
-                if let Some(r) = result {
-                    s.results.entry(r.id).or_insert(r.record);
+                // SET NX: an expired result counts as absent, as in Redis.
+                if let Some(r) = result
+                    && s.result(&r.id).is_none()
+                {
+                    s.store_result(r);
                 }
                 return Ok(false);
             }
@@ -361,10 +599,10 @@ impl Broker for MemoryBroker {
             return Ok(false);
         }
         s.pending.remove(&d.stream_id);
-        s.dead.push(DeadEntry { queue: d.queue.clone(), header: Some(d.header.clone()), error: error.into() });
+        s.push_dead(&d.queue, Some(d.header.clone()), d.raw_header.clone(), d.payload.clone(), error.into());
         Self::store(&mut s, result);
         if let Ok(Some((wf, i))) = Self::workflow_node(d)
-            && let Some(n) = s.workflows.get_mut(wf).and_then(|w| w.nodes.get_mut(i))
+            && let Some(n) = s.workflow_mut(wf).and_then(|w| w.nodes.get_mut(i))
             && n.state != NodeState::Done
         {
             n.state = NodeState::Dead;
@@ -460,7 +698,7 @@ impl Broker for MemoryBroker {
                 }),
                 Err(err) => {
                     s.pending.remove(&id);
-                    s.bury(queue, err.to_string());
+                    s.bury(queue, entry.h, entry.p, err.to_string());
                 }
             }
         }
@@ -470,8 +708,10 @@ impl Broker for MemoryBroker {
 
     async fn heartbeat(&self, info: &WorkerInfo, ttl_ms: u64) -> Result<()> {
         self.check()?;
-        let expires = Instant::now() + Duration::from_millis(ttl_ms);
-        self.state.lock().unwrap().workers.insert(info.worker_id.clone(), (info.clone(), expires));
+        let now = Instant::now();
+        let mut s = self.state.lock().unwrap();
+        s.workers.retain(|_, (_, expires)| *expires > now); // what Redis would have expired by now
+        s.workers.insert(info.worker_id.clone(), (info.clone(), now + Duration::from_millis(ttl_ms)));
         Ok(())
     }
 
@@ -514,7 +754,7 @@ impl Broker for MemoryBroker {
         wf.validate()?;
         {
             let mut s = self.state.lock().unwrap();
-            if s.workflows.contains_key(&wf.id) {
+            if s.workflow_mut(&wf.id).is_some() {
                 return Err(Error::Broker(format!("workflow {} already exists", wf.id)));
             }
             let children = wf.children();
@@ -540,9 +780,12 @@ impl Broker for MemoryBroker {
             for (q, h, p) in roots {
                 s.push_stream(&q, h, p);
             }
+            let ttl = Duration::from_secs(wf.ttl_secs);
             s.workflows.insert(wf.id.clone(), MemWorkflow {
                 name: wf.name.clone(),
                 created_at: now_ms(),
+                ttl,
+                expires: Instant::now() + ttl,
                 cancelled: false,
                 done: 0,
                 nodes,
@@ -554,27 +797,14 @@ impl Broker for MemoryBroker {
 
     async fn workflow(&self, id: &str) -> Result<Option<WorkflowState>> {
         self.check()?;
-        let s = self.state.lock().unwrap();
-        Ok(s.workflows.get(id).map(|w| WorkflowState {
-            id: id.to_string(),
-            name: w.name.clone(),
-            created_at: w.created_at,
-            cancelled: w.cancelled,
-            nodes: w.nodes.iter().enumerate().map(|(i, n)| NodeInfo {
-                node: i.to_string(),
-                task_id: n.task_id.clone(),
-                task: n.task.clone(),
-                queue: n.queue.clone(),
-                state: n.state,
-                parents: n.parents.clone(),
-            }).collect(),
-        }))
+        let mut s = self.state.lock().unwrap();
+        Ok(s.workflow_mut(id).map(|w| w.state(id)))
     }
 
     async fn cancel_workflow(&self, id: &str) -> Result<bool> {
         self.check()?;
         let mut s = self.state.lock().unwrap();
-        match s.workflows.get_mut(id) {
+        match s.workflow_mut(id) {
             Some(w) if w.done < w.nodes.len() => {
                 w.cancelled = true;
                 Ok(true)
@@ -588,8 +818,8 @@ impl Broker for MemoryBroker {
         if self.fail_cancelled.load(Ordering::SeqCst) {
             return Err(Error::Broker("injected cancelled-check failure".into()));
         }
-        let s = self.state.lock().unwrap();
-        Ok(ids.iter().filter(|id| s.workflows.get(*id).is_some_and(|w| w.cancelled)).cloned().collect())
+        let mut s = self.state.lock().unwrap();
+        Ok(ids.iter().filter(|id| s.workflow_mut(id).is_some_and(|w| w.cancelled)).cloned().collect())
     }
 }
 

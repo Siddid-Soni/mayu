@@ -2,6 +2,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+pub use mayu_core::DeadLetter;
 use mayu_core::{
     Broker, Delivery, Error, Header, NodeInfo, NodeState, PublishedTasks, QueueStats, Reclaimed, Result, RunningTask, StoredResult,
     WorkerInfo, WorkflowSpec, WorkflowState, decode_header, decode_running, encode_delayed_member, encode_header,
@@ -144,24 +145,6 @@ async fn manager(client: &redis::Client, response_timeout: Duration) -> Result<C
         .set_response_timeout(Some(response_timeout))
         .set_number_of_retries(2);
     ConnectionManager::new_with_config(client.clone(), cfg).await.map_err(be)
-}
-
-/// A dead-lettered entry (`mayu:{q}:dead`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct DeadLetter {
-    /// Entry id in the dead stream; its millisecond part is when it was dead-lettered.
-    pub entry_id: String,
-    /// `None` if the header cannot be decoded (such entries are never replayed).
-    pub header: Option<Header>,
-    pub raw_header: Vec<u8>,
-    pub payload: Vec<u8>,
-    pub error: String,
-}
-
-impl DeadLetter {
-    pub fn dead_at_ms(&self) -> u64 {
-        self.entry_id.split('-').next().and_then(|ms| ms.parse().ok()).unwrap_or(0)
-    }
 }
 
 /// A stream entry: (entry id, fields).
