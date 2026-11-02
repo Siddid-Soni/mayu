@@ -69,6 +69,7 @@ pub fn decide(
                 .unwrap_or_else(|| backoff_ms(header.attempt, policy.base_ms, policy.cap_ms, jitter));
             let mut next = header.clone();
             next.attempt += 1;
+            next.redeliveries = 0; // a real retry starts a fresh attempt
             next.eta = Some(now_ms.saturating_add(delay));
             Action::Retry { header: next }
         }
@@ -124,6 +125,15 @@ mod tests {
         let a = decide(&hdr(0, 3), Outcome::Failure { error: "E".into(), traceback: "tb".into() },
                        &RetryPolicy::default(), 1_000, |m| m);
         assert!(matches!(a, Action::Dead { ref error, ref traceback } if error == "E" && traceback == "tb"));
+    }
+
+    #[test]
+    fn a_real_retry_resets_the_redelivery_count() {
+        let mut h = hdr(0, 3);
+        h.redeliveries = 4;
+        let a = decide(&h, Outcome::Retry { countdown_ms: Some(10), error: "x".into() },
+                       &RetryPolicy::default(), 1_000, |m| m);
+        assert!(matches!(a, Action::Retry { ref header } if header.redeliveries == 0));
     }
 
     #[test]

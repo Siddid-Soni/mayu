@@ -224,7 +224,7 @@ impl RedisBroker {
     }
 
     async fn dead_raw(&self, queue: &str, stream_id: &str, h: &[u8], p: &[u8], error: &str,
-                      result: Option<StoredResult>) -> Result<()> {
+                      result: Option<StoredResult>) -> Result<bool> {
         let (flag, id, record, ttl) = match result {
             Some(r) => ("1", r.id, r.record, r.ttl_secs),
             None => ("0", String::new(), Vec::new(), 0),
@@ -237,8 +237,9 @@ impl RedisBroker {
         if let Some((wf, _)) = node { inv.key(workflow_key(wf)); }
         inv.arg(GROUP).arg(stream_id).arg(h).arg(p).arg(error).arg(flag).arg(record).arg(ttl);
         if let Some((_, n)) = node { inv.arg(n); }
-        inv.invoke_async::<i64>(&mut self.conn.clone()).await.map_err(be)?;
-        Ok(())
+        inv.arg(&self.consumer);
+        let applied = inv.invoke_async::<i64>(&mut self.conn.clone()).await.map_err(be)?;
+        Ok(applied == 1)
     }
 
     /// Non-blocking ordered claim of up to `count` entries (one round trip).
@@ -310,6 +311,7 @@ impl RedisBroker {
                 queue: queue.to_string(), stream_id, header, raw_header, payload: p, delivery_count,
             })),
             (h, _) => {
+                // Just claimed by this consumer, so the settle is never stale.
                 self.dead_raw(queue, &stream_id, &h.unwrap_or_default(), &p, "undecodable envelope header", None)
                     .await?;
                 Ok(None)
@@ -625,7 +627,7 @@ impl Broker for RedisBroker {
         self.fetch_blocking(queues, (count / queues.len()).max(1), block_ms).await
     }
 
-    async fn ack(&self, d: &Delivery, result: Option<StoredResult>, follow_ups: &[(Header, Vec<u8>)]) -> Result<()> {
+    async fn ack(&self, d: &Delivery, result: Option<StoredResult>, follow_ups: &[(Header, Vec<u8>)]) -> Result<bool> {
         let (flag, id, record, ttl) = match result {
             Some(r) => ("1", r.id, r.record, r.ttl_secs),
             None => ("0", String::new(), Vec::new(), 0),
@@ -639,44 +641,46 @@ impl Broker for RedisBroker {
             })?;
             let released = self.scripts.release
                 .key(stream_key(&d.queue)).key(result_key(&id)).key(workflow_key(wf))
-                .arg(GROUP).arg(&d.stream_id).arg(flag).arg(record).arg(ttl).arg(node)
+                .arg(GROUP).arg(&d.stream_id).arg(flag).arg(record).arg(ttl).arg(node).arg(&self.consumer)
                 .invoke_async::<i64>(&mut self.conn.clone()).await.map_err(be)?;
+            if released == -2 {
+                return Ok(false);
+            }
             if released < 0 {
                 tracing::warn!(
                     task_id = %d.header.id, workflow_id = %wf,
                     "workflow state is gone (expired?); acked without releasing its children"
                 );
             }
-            return Ok(());
+            return Ok(true);
         }
         let mut inv = self.scripts.ack.prepare_invoke();
         inv.key(stream_key(&d.queue)).key(result_key(&id));
         for (h, _) in follow_ups { inv.key(stream_key(&h.queue)); }
         inv.arg(GROUP).arg(&d.stream_id).arg(flag).arg(record).arg(ttl);
         for (h, p) in follow_ups { inv.arg(encode_header(h)).arg(p); }
-        inv.invoke_async::<i64>(&mut self.conn.clone()).await.map_err(be)?;
-        Ok(())
+        inv.arg(&self.consumer);
+        let applied = inv.invoke_async::<i64>(&mut self.conn.clone()).await.map_err(be)?;
+        Ok(applied == 1)
     }
 
-    async fn retry(&self, d: &Delivery, header: &Header) -> Result<()> {
+    async fn retry(&self, d: &Delivery, header: &Header) -> Result<bool> {
         let member = encode_delayed_member(&encode_header(header), &d.payload);
         self.scripts.retry
             .key(stream_key(&d.queue)).key(delayed_key(&d.queue))
-            .arg(GROUP).arg(&d.stream_id).arg(header.eta.unwrap_or(0)).arg(member)
-            .invoke_async::<i64>(&mut self.conn.clone()).await.map_err(be)?;
-        Ok(())
+            .arg(GROUP).arg(&d.stream_id).arg(header.eta.unwrap_or(0)).arg(member).arg(&self.consumer)
+            .invoke_async::<i64>(&mut self.conn.clone()).await.map_err(be).map(|applied| applied == 1)
     }
 
-    async fn dead_letter(&self, d: &Delivery, error: &str, result: Option<StoredResult>) -> Result<()> {
+    async fn dead_letter(&self, d: &Delivery, error: &str, result: Option<StoredResult>) -> Result<bool> {
         self.dead_raw(&d.queue, &d.stream_id, &d.raw_header, &d.payload, error, result).await
     }
 
-    async fn requeue(&self, d: &Delivery) -> Result<()> {
+    async fn requeue(&self, d: &Delivery) -> Result<bool> {
         self.scripts.requeue
             .key(stream_key(&d.queue))
-            .arg(GROUP).arg(&d.stream_id).arg(&d.raw_header).arg(&d.payload)
-            .invoke_async::<i64>(&mut self.conn.clone()).await.map_err(be)?;
-        Ok(())
+            .arg(GROUP).arg(&d.stream_id).arg(&d.raw_header).arg(&d.payload).arg(&self.consumer)
+            .invoke_async::<i64>(&mut self.conn.clone()).await.map_err(be).map(|applied| applied == 1)
     }
 
     async fn promote(&self, queue: &str, now_ms: u64, limit: usize) -> Result<usize> {

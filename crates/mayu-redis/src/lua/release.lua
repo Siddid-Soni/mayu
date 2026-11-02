@@ -1,15 +1,24 @@
 -- KEYS[1]=stream KEYS[2]=result key KEYS[3]=workflow hash
 -- ARGV[1]=group ARGV[2]=entry id ARGV[3]=store result ('1'/'0') ARGV[4]=record ARGV[5]=result ttl secs
--- ARGV[6]=node index of the acked task
+-- ARGV[6]=node index of the acked task ARGV[7]=the acking consumer
 -- Acks a workflow node (as ack.lua does, minus link follow-ups) and in the same step marks the node done and
 -- XADDs each child that was waiting and has all its parents done. The node's state decides, not XACK's return:
 -- a duplicate run or a retried ack finds it done and releases nothing. In a cancelled workflow the node
 -- becomes cancelled and nothing is released. Returns the number of children released, or -1 if the
 -- hash is gone (expired): the entry is still acked, nothing is released.
+-- If ARGV[7] no longer owns the entry (reclaimed by another worker, or already settled), nothing is acked or
+-- released and the node is untouched; a result being stored is written only if none exists (SET NX).
+-- Returns -2 then.
 -- Raises an error, before changing anything, if the node or a ready child is missing from the hash.
 -- Hash layout (see submit.lua): n:<i>:{s,q,up,down,h,b}, plus status, done, ttl.
 -- Not Redis-Cluster-safe: child stream keys are built here, not passed in KEYS. ack.lua has the same
 -- limit (result keys carry no hash tag), so this adds no new restriction.
+if #redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[2], ARGV[2], 1, ARGV[7]) == 0 then
+  if ARGV[3] == '1' then
+    redis.call('SET', KEYS[2], ARGV[4], 'EX', ARGV[5], 'NX')
+  end
+  return -2
+end
 local wf = KEYS[3]
 local exists = redis.call('EXISTS', wf) == 1
 local state, status, ttl

@@ -255,18 +255,50 @@ fn poison_message_is_dead_lettered_without_running() {
     b.shutdown(Duration::from_secs(1));
 }
 
-#[test]
-fn lost_ownership_still_completes() {
-    let mem = MemoryBroker::default();
-    mem.push(&Header::new("t", "q", 0, "ct"), b"");
-    let a = start_as(&mem, "a", rel_cfg("a", 10_000, 5));
+/// The worker's `mayu_settles_stale_total` count for `op`, scraped from its metrics endpoint.
+fn stale_count(rt: &Runtime<MemoryBroker>, op: &str) -> f64 {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(rt.metrics_addr().unwrap()).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let mut body = String::new();
+    s.read_to_string(&mut body).unwrap();
+    let series = format!(r#"mayu_settles_stale_total{{queue="q",task="t",op="{op}"}} "#);
+    body.lines().find_map(|l| l.strip_prefix(&series)?.parse().ok()).unwrap_or(0.0)
+}
+
+/// `a` runs a task that `thief` then reclaims, as if `a` had stalled past the visibility timeout.
+fn stolen_from(mem: &MemoryBroker, max_retries: u32) -> (Runtime<MemoryBroker>, mayu_core::ReadyTask, Header) {
+    let h = Header::new("t", "q", max_retries, "ct");
+    mem.push(&h, b"");
+    let c = RuntimeConfig { metrics_addr: Some("127.0.0.1:0".parse().unwrap()), ..rel_cfg("a", 10_000, 5) };
+    let a = start_as(mem, "a", c);
     let t = a.recv_timeout(RECV).unwrap();
-    // Another worker steals the entry, as if `a` had stalled past the visibility timeout.
     let thief = mem.with_consumer("thief");
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     assert_eq!(rt.block_on(thief.reclaim("q", 0, "0-0", 10)).unwrap().deliveries.len(), 1);
+    (a, t, h)
+}
+
+#[test]
+fn lost_ownership_does_not_settle_the_new_owners_entry() {
+    let mem = MemoryBroker::default();
+    let (a, t, _) = stolen_from(&mem, 0);
     a.complete(t.token, Outcome::Success { result: None, links: vec![] });
-    wait_until(|| mem.pending_len() == 0);
+    wait_until(|| stale_count(&a, "ack") == 1.0);
+    assert_eq!(mem.pending_len(), 1, "the new owner's entry must stay pending");
+    a.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn failure_after_lost_ownership_is_counted_stale_and_not_dead_lettered() {
+    let mem = MemoryBroker::default();
+    let (a, t, h) = stolen_from(&mem, 0);
+    a.complete(t.token, Outcome::Failure { error: "E".into(), traceback: "tb".into() });
+    wait_until(|| stale_count(&a, "dead") == 1.0);
+    assert!(mem.dead().is_empty(), "a stale failure must not reach the dead letters");
+    assert!(mem.result(&h.id).is_none(), "nor store a failure result");
+    assert_eq!(mem.pending_len(), 1);
     a.shutdown(Duration::from_secs(1));
 }
 
@@ -671,5 +703,49 @@ fn heartbeat_publishes_at_most_the_cap() {
     for t in tokens {
         rt.complete(t, Outcome::Success { result: None, links: vec![] });
     }
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn rate_limit_deferral_keeps_the_crash_count() {
+    let mem = MemoryBroker::default();
+    let v = Header::new("slow", "q", 0, "ct");
+    mem.push(&v, b"");
+    // delivery 1: a worker takes it and crashes
+    let a = start_as(&mem, "a", rel_cfg("a", 200, 2));
+    let _ = a.recv_timeout(RECV).unwrap();
+    drop(a);
+    // delivery 2: b reclaims it, but a filler has used the rate-limit slot, so b defers it instead of running it
+    mem.push(&Header::new("slow", "q", 0, "ct"), b"");
+    let bc = RuntimeConfig { rate_limits: [("slow".to_string(), 0.5)].into(), concurrency: 2, prefetch_multiplier: 2, ..rel_cfg("b", 200, 2) };
+    let b = start_as(&mem, "b", bc);
+    // the filler takes the slot first; the reclaimed task then waits in the delayed set for the next one
+    let f = b.recv_timeout(RECV).unwrap();
+    assert_ne!(f.id, v.id);
+    b.complete(f.token, Outcome::Success { result: None, links: vec![] });
+    wait_until(|| mem.delayed_len("q") == 1);
+    let again = b.recv_timeout(Duration::from_secs(5)).expect("the deferred task comes back");
+    assert_eq!(again.id, v.id);
+    assert_eq!(mem.dead().len(), 0);
+    drop(b); // delivery 3 crashes too: three deliveries without a settle, over max_deliveries = 2
+    let c = start_as(&mem, "c", rel_cfg("c", 200, 2));
+    assert!(c.recv_timeout(Duration::from_millis(800)).is_none(), "poison message must not run again");
+    wait_until(|| mem.dead().len() == 1 && mem.pending_len() == 0);
+    assert!(mem.dead()[0].error.contains("poison"));
+    c.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn tasks_deferred_many_times_are_never_buried_as_poison() {
+    let mem = MemoryBroker::default();
+    for _ in 0..30 { mem.push(&Header::new("slow", "q", 0, "ct"), b""); }
+    let c = RuntimeConfig { max_deliveries: 1, reclaim_interval_ms: 20, visibility_timeout_ms: 60_000, ..limited(30.0, 4, 4) };
+    let rt = start(&mem, c);
+    for _ in 0..30 {
+        let t = rt.recv_timeout(RECV).unwrap();
+        rt.complete(t.token, Outcome::Success { result: None, links: vec![] });
+    }
+    wait_until(|| mem.pending_len() == 0);
+    assert!(mem.dead().is_empty(), "deferral is not a crash");
     rt.shutdown(Duration::from_secs(1));
 }

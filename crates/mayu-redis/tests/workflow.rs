@@ -489,3 +489,22 @@ async fn an_ordinary_header_is_stored_byte_for_byte_as_before() {
     let back = decode_header(&stored).unwrap();
     assert_eq!((back.workflow_id, back.node), (None, None));
 }
+
+// Plan 30: a worker that lost a workflow node to a reclaim must not ack it.
+#[tokio::test]
+async fn stale_ack_of_a_workflow_node_releases_nothing() {
+    let (a, q) = setup().await;
+    let b = RedisBroker::connect(&url(), uniq("c")).await.unwrap();
+    // a -> (b, c)
+    let wf = WorkflowSpec::new("fan", 3600, vec![node("a", &q, &[]), node("b", &q, &[0]), node("c", &q, &[0])]);
+    a.submit_workflow(&wf).await.unwrap();
+    let da = fetch_all(&a, &q).await.remove(0);
+    let db = b.reclaim(&q, 0, "0-0", 10).await.unwrap().deliveries.remove(0);
+
+    assert!(!a.ack(&da, None, &[]).await.unwrap());
+    assert_eq!(states(&state_of(&b, &wf).await), vec![Queued, Waiting, Waiting], "stale ack changed the node");
+    assert!(fetch_all(&b, &q).await.is_empty(), "stale ack released children");
+
+    assert!(b.ack(&db, None, &[]).await.unwrap());
+    assert_eq!(tasks(&fetch_all(&b, &q).await), vec!["b", "c"], "B's ack releases the children once");
+}

@@ -27,6 +27,14 @@ pub struct Header {
     /// settling it as `expired`. Absent from an ordinary task's bytes, so older workers ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires: Option<u64>,
+    /// Earlier deliveries of this attempt that ended without a settle (a crash or a lost worker), carried across
+    /// rate-limit deferral so `--max-deliveries` still counts them. Absent when 0, so older workers ignore it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub redeliveries: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl Header {
@@ -49,6 +57,7 @@ impl Header {
             workflow_id: None,
             node: None,
             expires: None,
+            redeliveries: 0,
         }
     }
 }
@@ -178,6 +187,30 @@ mod tests {
         // expires is skipped when None, so an ordinary task's bytes are unchanged for a rolling deploy.
         let h = Header::new("app.add", "default", 3, "application/msgpack");
         assert_eq!(h.expires, None);
+        assert_eq!(encode_header(&h), rmp_serde::to_vec_named(&old_of(&h)).unwrap());
+    }
+
+    #[test]
+    fn redeliveries_roundtrips_and_old_readers_ignore_it() {
+        let mut h = Header::new("t", "q", 1, "ct");
+        h.redeliveries = 3;
+        let bytes = encode_header(&h);
+        assert_eq!(decode_header(&bytes).unwrap().redeliveries, 3);
+        let old: OldHeader = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(old, old_of(&h));
+    }
+
+    #[test]
+    fn header_without_redeliveries_decodes_with_zero() {
+        let h = Header::new("t", "q", 1, "ct");
+        let back = decode_header(&rmp_serde::to_vec_named(&old_of(&h)).unwrap()).unwrap();
+        assert_eq!(back.redeliveries, 0);
+    }
+
+    #[test]
+    fn zero_redeliveries_matches_the_old_bytes() {
+        let h = Header::new("app.add", "default", 3, "application/msgpack");
+        assert_eq!(h.redeliveries, 0);
         assert_eq!(encode_header(&h), rmp_serde::to_vec_named(&old_of(&h)).unwrap());
     }
 

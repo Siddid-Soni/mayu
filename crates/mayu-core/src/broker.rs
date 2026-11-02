@@ -78,18 +78,24 @@ pub trait Broker: Send + Sync + 'static {
     /// Acks `d` and enqueues `follow_ups` (link callbacks) in one atomic step. The follow-ups are
     /// enqueued only if this call is the one that acks `d`, so a repeated ack adds no duplicates.
     ///
+    /// Returns `false` (stale) when this consumer no longer owns `d` (another worker reclaimed it, or it
+    /// was already settled): nothing is acked, enqueued or released, and a result is stored only if none
+    /// exists yet. The same holds for `retry`, `dead_letter` and `requeue`, which then change nothing.
+    ///
     /// When `d.header.workflow_id` is set, `d` is a workflow node: the same step also marks the node
     /// done and enqueues every child whose parents are now all done, each at most once however many
     /// times the node is acked. `follow_ups` must be empty for a node (`Error::Broker` otherwise).
     /// In a cancelled workflow the node is marked cancelled and nothing is released.
     fn ack(&self, d: &Delivery, result: Option<StoredResult>, follow_ups: &[(Header, Vec<u8>)])
-        -> impl Future<Output = Result<()>> + Send;
-    fn retry(&self, d: &Delivery, header: &Header) -> impl Future<Output = Result<()>> + Send;
+        -> impl Future<Output = Result<bool>> + Send;
+    /// Schedules `d` to run again from `header`. `true` if applied, `false` if stale (see `ack`).
+    fn retry(&self, d: &Delivery, header: &Header) -> impl Future<Output = Result<bool>> + Send;
     /// Moves `d` to the dead letters. A workflow node that isn't done yet is marked dead in the
-    /// same step, which keeps its descendants waiting.
+    /// same step, which keeps its descendants waiting. `true` if applied, `false` if stale (see `ack`).
     fn dead_letter(&self, d: &Delivery, error: &str, result: Option<StoredResult>)
-        -> impl Future<Output = Result<()>> + Send;
-    fn requeue(&self, d: &Delivery) -> impl Future<Output = Result<()>> + Send;
+        -> impl Future<Output = Result<bool>> + Send;
+    /// Puts `d` back on the stream. `true` if applied, `false` if stale (see `ack`).
+    fn requeue(&self, d: &Delivery) -> impl Future<Output = Result<bool>> + Send;
     fn promote(&self, queue: &str, now_ms: u64, limit: usize) -> impl Future<Output = Result<usize>> + Send;
     fn get_result(&self, id: &str) -> impl Future<Output = Result<Option<Vec<u8>>>> + Send;
     /// Depth of `queue`: stream entries (unclaimed + claimed), claimed, delayed, dead.

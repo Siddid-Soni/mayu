@@ -597,3 +597,119 @@ async fn running_all_lists_every_live_workers_tasks_and_survives_a_malformed_fie
     b.unregister(&w1).await.unwrap();
     assert!(ours(&b.running_all().await.unwrap(), &w1).is_empty());
 }
+
+// A worker that lost a task to a reclaim must not settle it (plan 30). Each test: A fetches, B reclaims,
+// then A settles (stale) and, where relevant, B settles.
+
+fn stored(id: &str, record: &str) -> Option<StoredResult> {
+    Some(StoredResult { id: id.to_string(), record: record.as_bytes().to_vec(), ttl_secs: 60 })
+}
+
+/// Two workers on one queue; A has fetched a task and B has reclaimed it.
+async fn a_lost_to_b() -> (RedisBroker, RedisBroker, String, mayu_core::Delivery, mayu_core::Delivery) {
+    let (a, q) = setup().await;
+    let b = RedisBroker::connect(&url(), uniq("c")).await.unwrap();
+    a.enqueue(&Header::new("t", &q, 3, "ct"), b"x").await.unwrap();
+    let da = a.fetch(std::slice::from_ref(&q), 1, 100).await.unwrap().remove(0);
+    let db = b.reclaim(&q, 0, "0-0", 10).await.unwrap().deliveries.remove(0);
+    assert_eq!((db.stream_id.as_str(), db.delivery_count), (da.stream_id.as_str(), 2));
+    (a, b, q, da, db)
+}
+
+async fn drain(b: &RedisBroker, q: &str) -> Vec<mayu_core::Delivery> {
+    b.fetch(&[q.to_string()], 10, 50).await.unwrap()
+}
+
+#[tokio::test]
+async fn stale_retry_leaves_the_new_owners_entry() {
+    let (a, b, q, da, _) = a_lost_to_b().await;
+    let mut next = da.header.clone();
+    next.attempt = 1;
+    next.eta = Some(now_ms());
+    assert!(!a.retry(&da, &next).await.unwrap());
+    let s = b.queue_stats(&q).await.unwrap();
+    assert_eq!((s.pending, s.delayed), (1, 0), "stale retry must not ack B's entry or schedule a second run");
+}
+
+#[tokio::test]
+async fn stale_dead_letter_does_not_overwrite_the_new_owners_success() {
+    let (a, b, q, da, db) = a_lost_to_b().await;
+    let id = &da.header.id;
+    assert!(!a.dead_letter(&da, "boom", stored(id, "failure")).await.unwrap());
+    let s = b.queue_stats(&q).await.unwrap();
+    assert_eq!((s.pending, s.dead), (1, 0), "stale dead_letter must leave B's entry pending");
+    assert!(b.ack(&db, stored(id, "success"), &[]).await.unwrap());
+    assert_eq!(b.queue_stats(&q).await.unwrap().dead, 0, "a task B completed must not be dead-lettered");
+    assert_eq!(b.get_result(id).await.unwrap(), Some(b"success".to_vec()));
+}
+
+#[tokio::test]
+async fn stale_requeue_adds_no_second_copy() {
+    let (a, b, q, da, _) = a_lost_to_b().await;
+    assert!(!a.requeue(&da).await.unwrap());
+    let s = b.queue_stats(&q).await.unwrap();
+    assert_eq!((s.stream, s.pending), (1, 1), "stale requeue must leave only B's pending entry");
+    assert!(drain(&b, &q).await.is_empty(), "no second copy to fetch");
+}
+
+#[tokio::test]
+async fn stale_ack_is_overwritten_by_the_owner_and_adds_no_follow_ups() {
+    let (a, b, q, da, db) = a_lost_to_b().await;
+    let id = &da.header.id;
+    let cbq = uniq("q");
+    b.ensure_queues(std::slice::from_ref(&cbq)).await.unwrap();
+    let (cb_a, cb_b) = (Header::new("cb-a", &cbq, 0, "ct"), Header::new("cb-b", &cbq, 0, "ct"));
+    assert!(!a.ack(&da, stored(id, "a"), &[(cb_a, b"a".to_vec())]).await.unwrap());
+    assert_eq!(b.queue_stats(&q).await.unwrap().pending, 1, "stale ack must leave B's entry pending");
+    assert!(b.ack(&db, stored(id, "b"), &[(cb_b, b"b".to_vec())]).await.unwrap());
+    assert_eq!(b.get_result(id).await.unwrap(), Some(b"b".to_vec()));
+    let follow = drain(&b, &cbq).await;
+    assert_eq!(follow.iter().map(|d| d.header.task.as_str()).collect::<Vec<_>>(), ["cb-b"], "added once, by B");
+}
+
+#[tokio::test]
+async fn stale_ack_after_the_owner_keeps_its_result_and_adds_no_follow_ups() {
+    let (a, b, _, da, db) = a_lost_to_b().await;
+    let id = &da.header.id;
+    let cbq = uniq("q");
+    b.ensure_queues(std::slice::from_ref(&cbq)).await.unwrap();
+    let (cb_a, cb_b) = (Header::new("cb-a", &cbq, 0, "ct"), Header::new("cb-b", &cbq, 0, "ct"));
+    assert!(b.ack(&db, stored(id, "b"), &[(cb_b, b"b".to_vec())]).await.unwrap());
+    assert!(!a.ack(&da, stored(id, "a"), &[(cb_a, b"a".to_vec())]).await.unwrap());
+    assert_eq!(b.get_result(id).await.unwrap(), Some(b"b".to_vec()), "a late stale ack must not overwrite");
+    let follow = drain(&b, &cbq).await;
+    assert_eq!(follow.iter().map(|d| d.header.task.as_str()).collect::<Vec<_>>(), ["cb-b"]);
+}
+
+#[tokio::test]
+async fn retry_repeated_after_it_applied_schedules_once() {
+    let (b, q) = setup().await;
+    b.enqueue(&Header::new("t", &q, 3, "ct"), b"x").await.unwrap();
+    let d = b.fetch(std::slice::from_ref(&q), 1, 100).await.unwrap().remove(0);
+    let mut next = d.header.clone();
+    next.attempt = 1;
+    next.eta = Some(now_ms() + 60_000);
+    assert!(b.retry(&d, &next).await.unwrap());
+    assert!(!b.retry(&d, &next).await.unwrap()); // the first reply was lost
+    assert_eq!(b.queue_stats(&q).await.unwrap().delayed, 1);
+}
+
+#[tokio::test]
+async fn dead_letter_repeated_after_it_applied_buries_once() {
+    let (b, q) = setup().await;
+    b.enqueue(&Header::new("t", &q, 0, "ct"), b"x").await.unwrap();
+    let d = b.fetch(std::slice::from_ref(&q), 1, 100).await.unwrap().remove(0);
+    assert!(b.dead_letter(&d, "boom", None).await.unwrap());
+    assert!(!b.dead_letter(&d, "boom", None).await.unwrap());
+    assert_eq!(b.queue_stats(&q).await.unwrap().dead, 1);
+}
+
+#[tokio::test]
+async fn requeue_repeated_after_it_applied_adds_one_copy() {
+    let (b, q) = setup().await;
+    b.enqueue(&Header::new("t", &q, 0, "ct"), b"x").await.unwrap();
+    let d = b.fetch(std::slice::from_ref(&q), 1, 100).await.unwrap().remove(0);
+    assert!(b.requeue(&d).await.unwrap());
+    assert!(!b.requeue(&d).await.unwrap());
+    assert_eq!(b.queue_stats(&q).await.unwrap().stream, 1);
+}
