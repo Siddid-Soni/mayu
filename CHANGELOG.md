@@ -9,6 +9,8 @@ All notable changes to mayu are documented here. The format follows
 ### Added
 
 - Task expiry: `send(..., expires=30)` (seconds from now, or a timezone-aware `datetime`) drops a task at claim time if no worker started it by the deadline, settling it as `outcome="expired"` in `mayu_tasks_settled_total` and storing a "task expired" failure (when results are enabled). `expires` is now a reserved option name. Opt-in: tasks sent without it behave exactly as before. The deadline rides in a new optional envelope field, so older workers ignore it (they won't enforce expiry); upgrade workers first.
+- Embedded mode: `App(broker="memory://")` (or `memory://<name>`, or `MAYU_BROKER=memory://`) runs producers and workers in one process with no Redis. Start the worker from the program with the new `app.worker(queues=..., threads=..., **options)`, which returns a worker with `start()`/`stop()`/`join()` and works as a context manager. Tasks, results, retries, dead letters and replay, links, workflows, rate limits, resources, pools and progress work as with Redis; apps naming the same broker share it; queued work is lost at exit. Thread mode only (`mode="process"` raises `ValueError`), and `mayu worker`/`inspect`/`dead` exit with an error for a `memory://` app. Opt-in: `redis://` URLs take the same code path as before, with no wire or key-layout change.
+
 
 ### Fixed
 

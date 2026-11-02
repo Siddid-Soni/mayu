@@ -30,7 +30,7 @@ pip install "mayu[otel]"    # with OpenTelemetry tracing
 pip install "mayu[gpu]"     # with NVIDIA GPU monitoring (NVML)
 ```
 
-Requires Python 3.13+ and Redis. Use a free-threaded build (`python3.14t`, e.g.
+Requires Python 3.13+ and Redis (or no Redis, in [embedded mode](#embedded-mode-no-redis)). Use a free-threaded build (`python3.14t`, e.g.
 `uv venv --python 3.14t`) to get thread mode.
 
 ## Quickstart
@@ -667,6 +667,45 @@ limit takes its process down with it, and the process is replaced.
 
 Prefer **a few processes × many threads**: a segfault in a C extension takes down every task in
 its process.
+
+## Embedded mode (no Redis)
+
+For scripts, local agents and laptops, `memory://` runs producers and workers in one process with no Redis:
+
+```python
+from mayu import App
+
+app = App(broker="memory://", result_ttl=3600)
+
+@app.task(max_retries=3, resources={"gpu": 1})
+def render(scene: str) -> str:
+    ...
+
+with app.worker(threads=8, resources={"gpu": 1}):   # tasks run on threads of this process
+    handles = [render.send(s) for s in scenes]
+    paths = [h.result(timeout=600) for h in handles]
+```
+
+- **URL forms:** `memory://` or `memory://<name>`. Apps in one process that use the same name share one broker
+  (one queue, results, workflows, dead letters); different names are separate. Anything after the name, like a
+  path or `?query`, is a `ValueError`. `MAYU_BROKER=memory://` works like any other URL.
+- **In-process only.** The broker lives inside the Python process, so the worker must be started from the same
+  program: `app.worker(queues=..., threads=..., **options)` returns a worker with `start()`, `stop()` and `join()`
+  (or use it in a `with` block, which stops it and waits for running tasks on exit). Its keyword options are the
+  `mayu worker` flags (`resources=`, `pools=`, `pool_mode="lazy"`, `heartbeat_interval=`, ...). `mayu worker`,
+  `mayu inspect` and `mayu dead` refuse a `memory://` app with an error, since they run in another process;
+  `mayu.admin.inspect(app)`, `mayu.admin.dead_list(app, queue, limit)` and `mayu.admin.dead_replay(app, queue)`
+  give the same answers from inside the program.
+- **Thread mode only.** `app.worker()` runs tasks on threads; `mode="process"` raises `ValueError` (separate
+  processes can't reach the broker). On a GIL build `mode="auto"` still picks thread mode and logs that tasks
+  won't run Python code in parallel.
+- **Lost at exit.** Queued tasks, results and workflows live as long as the process. Nothing is persisted.
+- **What works:** everything a Redis-backed worker does: `send()` with `countdown`/`eta`/`expires`, results,
+  retries and dead letters (with replay), links, workflows, rate limits, resources, model pools (eager and lazy),
+  progress, time limits and metrics. Results and workflows expire on their TTLs as they would in Redis. There
+  is no process to replace, so when the worker would recycle itself (`max_tasks_per_process`,
+  `max_memory_per_process`, or more zombie threads than `max_zombie_threads`) it stops instead; `w.restart_reason`
+  says why.
 
 ## Memory and huge pages
 

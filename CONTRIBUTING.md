@@ -34,7 +34,8 @@ uv pip install --python .venv/bin/python maturin pytest msgpack opentelemetry-sd
 VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop --uv # rebuild after every Rust change
 ```
 
-Tests read `MAYU_TEST_REDIS` (default `redis://127.0.0.1:6390/0`).
+Tests read `MAYU_TEST_REDIS` (default `redis://127.0.0.1:6390/0`). `MAYU_TEST_BROKER=memory://` runs the Python suite on
+in-process brokers instead (embedded mode), skipping tests that use Redis directly.
 
 ## Running tests
 
