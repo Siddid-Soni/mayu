@@ -705,3 +705,47 @@ fn heartbeat_publishes_at_most_the_cap() {
     }
     rt.shutdown(Duration::from_secs(1));
 }
+
+#[test]
+fn rate_limit_deferral_keeps_the_crash_count() {
+    let mem = MemoryBroker::default();
+    let v = Header::new("slow", "q", 0, "ct");
+    mem.push(&v, b"");
+    // delivery 1: a worker takes it and crashes
+    let a = start_as(&mem, "a", rel_cfg("a", 200, 2));
+    let _ = a.recv_timeout(RECV).unwrap();
+    drop(a);
+    // delivery 2: b reclaims it, but a filler has used the rate-limit slot, so b defers it instead of running it
+    mem.push(&Header::new("slow", "q", 0, "ct"), b"");
+    let bc = RuntimeConfig { rate_limits: [("slow".to_string(), 0.5)].into(), concurrency: 2, prefetch_multiplier: 2, ..rel_cfg("b", 200, 2) };
+    let b = start_as(&mem, "b", bc);
+    // the filler takes the slot first; the reclaimed task then waits in the delayed set for the next one
+    let f = b.recv_timeout(RECV).unwrap();
+    assert_ne!(f.id, v.id);
+    b.complete(f.token, Outcome::Success { result: None, links: vec![] });
+    wait_until(|| mem.delayed_len("q") == 1);
+    let again = b.recv_timeout(Duration::from_secs(5)).expect("the deferred task comes back");
+    assert_eq!(again.id, v.id);
+    assert_eq!(mem.dead().len(), 0);
+    drop(b); // delivery 3 crashes too: three deliveries without a settle, over max_deliveries = 2
+    let c = start_as(&mem, "c", rel_cfg("c", 200, 2));
+    assert!(c.recv_timeout(Duration::from_millis(800)).is_none(), "poison message must not run again");
+    wait_until(|| mem.dead().len() == 1 && mem.pending_len() == 0);
+    assert!(mem.dead()[0].error.contains("poison"));
+    c.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn tasks_deferred_many_times_are_never_buried_as_poison() {
+    let mem = MemoryBroker::default();
+    for _ in 0..30 { mem.push(&Header::new("slow", "q", 0, "ct"), b""); }
+    let c = RuntimeConfig { max_deliveries: 1, reclaim_interval_ms: 20, visibility_timeout_ms: 60_000, ..limited(30.0, 4, 4) };
+    let rt = start(&mem, c);
+    for _ in 0..30 {
+        let t = rt.recv_timeout(RECV).unwrap();
+        rt.complete(t.token, Outcome::Success { result: None, links: vec![] });
+    }
+    wait_until(|| mem.pending_len() == 0);
+    assert!(mem.dead().is_empty(), "deferral is not a crash");
+    rt.shutdown(Duration::from_secs(1));
+}

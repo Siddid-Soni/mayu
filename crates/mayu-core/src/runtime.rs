@@ -861,6 +861,9 @@ async fn defer<B: Broker>(c: &FetchCtx<B>, task: ReadyTask, delay: Duration) {
     let Some(f) = c.inflight.lock().unwrap().remove(&task.token) else { return };
     let mut header = f.delivery.header.clone();
     header.eta = Some(now_ms().saturating_add(delay.as_millis() as u64));
+    // The fresh entry restarts delivery_count at 1; carry the earlier deliveries that never settled.
+    let crashed = u32::try_from(f.delivery.delivery_count.saturating_sub(1)).unwrap_or(u32::MAX);
+    header.redeliveries = header.redeliveries.saturating_add(crashed);
     match c.broker.retry(&f.delivery, &header).await {
         Ok(true) => {
             c.metrics.deferred(&task.queue, &task.task);
@@ -891,10 +894,11 @@ async fn reclaim_due<B: Broker>(c: &FetchCtx<B>, cursors: &mut HashMap<String, S
             Ok(r) => {
                 cursors.insert(q.clone(), r.next_cursor);
                 for d in r.deliveries {
-                    if d.delivery_count > c.max_deliveries {
+                    let deliveries = d.delivery_count.saturating_add(u64::from(d.header.redeliveries));
+                    if deliveries > c.max_deliveries {
                         bury_poison(c, &d).await;
                     } else {
-                        tracing::info!(task_id = %d.header.id, deliveries = d.delivery_count, "reclaimed abandoned task");
+                        tracing::info!(task_id = %d.header.id, deliveries, "reclaimed abandoned task");
                         c.metrics.reclaimed(q);
                         got.push(d);
                     }
@@ -910,7 +914,8 @@ async fn reclaim_due<B: Broker>(c: &FetchCtx<B>, cursors: &mut HashMap<String, S
 }
 
 async fn bury_poison<B: Broker>(c: &FetchCtx<B>, d: &Delivery) {
-    let error = format!("poison message: delivered {} times without completing", d.delivery_count);
+    let deliveries = d.delivery_count.saturating_add(u64::from(d.header.redeliveries));
+    let error = format!("poison message: delivered {deliveries} times without completing");
     let stored = c.result_ttl.map(|ttl_secs| StoredResult {
         id: d.header.id.clone(),
         record: ResultRecord::failure(&error, "", &d.header.content_type).encode(),
