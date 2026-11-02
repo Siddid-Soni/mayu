@@ -597,3 +597,30 @@ async fn running_all_lists_every_live_workers_tasks_and_survives_a_malformed_fie
     b.unregister(&w1).await.unwrap();
     assert!(ours(&b.running_all().await.unwrap(), &w1).is_empty());
 }
+
+#[tokio::test]
+async fn known_queues_keeps_a_dead_stream_after_replay() {
+    let (b, _) = setup().await;
+    let q = uniq("q"); // never ensured: only its dead stream makes it known
+    b.enqueue(&Header::new("t", &q, 0, "ct"), b"").await.unwrap();
+    b.ensure_queues(std::slice::from_ref(&q)).await.unwrap();
+    let d = b.fetch(std::slice::from_ref(&q), 1, 100).await.unwrap().remove(0);
+    b.dead_letter(&d, "e", None).await.unwrap();
+    let _: i64 = redis::cmd("DEL").arg(stream_key(&q)).query_async(&mut raw().await).await.unwrap();
+    let id = b.last_dead_id(&q).await.unwrap().unwrap();
+    b.replay_dead(&q, &[id]).await.unwrap();
+    let _: i64 = redis::cmd("DEL").arg(stream_key(&q)).query_async(&mut raw().await).await.unwrap();
+    assert!(b.known_queues().await.unwrap().contains(&q));
+}
+
+#[tokio::test]
+async fn results_expire_after_their_ttl() {
+    let (b, q) = setup().await;
+    let h = Header::new("t", &q, 0, "ct");
+    b.enqueue(&h, b"").await.unwrap();
+    let d = b.fetch(std::slice::from_ref(&q), 1, 100).await.unwrap().remove(0);
+    b.ack(&d, Some(StoredResult { id: h.id.clone(), record: b"r".to_vec(), ttl_secs: 1 }), &[]).await.unwrap();
+    assert_eq!(b.get_result(&h.id).await.unwrap(), Some(b"r".to_vec()));
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert_eq!(b.get_result(&h.id).await.unwrap(), None);
+}

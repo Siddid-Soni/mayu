@@ -489,3 +489,24 @@ async fn an_ordinary_header_is_stored_byte_for_byte_as_before() {
     let back = decode_header(&stored).unwrap();
     assert_eq!((back.workflow_id, back.node), (None, None));
 }
+
+#[tokio::test]
+async fn a_workflow_expires_after_its_ttl_and_a_release_refreshes_it() {
+    let (b, q) = setup().await;
+    let wf = WorkflowSpec::new("ttl", 1, vec![node("a", &q, &[]), node("b", &q, &[0])]);
+    b.submit_workflow(&wf).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let a = b.fetch(std::slice::from_ref(&q), 1, 100).await.unwrap().remove(0);
+    b.ack(&a, None, &[]).await.unwrap(); // the release restores the full second
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let s = b.workflow(&wf.id).await.unwrap().expect("refreshed by the release");
+    assert_eq!(s.nodes[0].state, Done);
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    assert!(b.workflow(&wf.id).await.unwrap().is_none(), "expired");
+    assert!(!b.workflows().await.unwrap().iter().any(|w| w.id == wf.id));
+    assert!(!b.cancel_workflow(&wf.id).await.unwrap());
+    // The released child still runs; its ack finds no workflow and releases nothing.
+    let child = b.fetch(std::slice::from_ref(&q), 1, 100).await.unwrap().remove(0);
+    b.ack(&child, None, &[]).await.unwrap();
+    assert_eq!(b.queue_stats(&q).await.unwrap().stream, 0);
+}
