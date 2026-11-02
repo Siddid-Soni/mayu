@@ -491,7 +491,6 @@ async fn an_ordinary_header_is_stored_byte_for_byte_as_before() {
 }
 
 // Plan 30: a worker that lost a workflow node to a reclaim must not ack it.
-// TODO(plan 30, task 2): also assert the stale ack returns `false` once settles return `Result<bool>`.
 #[tokio::test]
 async fn stale_ack_of_a_workflow_node_releases_nothing() {
     let (a, q) = setup().await;
@@ -502,10 +501,10 @@ async fn stale_ack_of_a_workflow_node_releases_nothing() {
     let da = fetch_all(&a, &q).await.remove(0);
     let db = b.reclaim(&q, 0, "0-0", 10).await.unwrap().deliveries.remove(0);
 
-    a.ack(&da, None, &[]).await.unwrap();
+    assert!(!a.ack(&da, None, &[]).await.unwrap());
     assert_eq!(states(&state_of(&b, &wf).await), vec![Queued, Waiting, Waiting], "stale ack changed the node");
     assert!(fetch_all(&b, &q).await.is_empty(), "stale ack released children");
 
-    b.ack(&db, None, &[]).await.unwrap();
+    assert!(b.ack(&db, None, &[]).await.unwrap());
     assert_eq!(tasks(&fetch_all(&b, &q).await), vec!["b", "c"], "B's ack releases the children once");
 }

@@ -57,6 +57,8 @@ struct Counters {
     settled: BTreeMap<(String, String, Settled), u64>,
     durations: BTreeMap<Key, Histogram>,
     deferred: BTreeMap<Key, u64>,
+    /// (queue, task, op): settles ignored because another worker owns or already settled the task.
+    settles_stale: BTreeMap<(String, String, &'static str), u64>,
     reclaimed: BTreeMap<String, u64>,
     broker_errors: BTreeMap<&'static str, u64>,
     pool_rebuilds: BTreeMap<String, u64>,
@@ -147,6 +149,11 @@ impl Metrics {
         *self.c.lock().unwrap().deferred.entry(key(queue, task)).or_default() += 1;
     }
 
+    /// A settle (`op`: ack, retry, dead or requeue) was ignored: this worker no longer owned the task.
+    pub fn settle_stale(&self, queue: &str, task: &str, op: &'static str) {
+        *self.c.lock().unwrap().settles_stale.entry((queue.to_string(), task.to_string(), op)).or_default() += 1;
+    }
+
     pub fn reclaimed(&self, queue: &str) {
         *self.c.lock().unwrap().reclaimed.entry(queue.to_string()).or_default() += 1;
     }
@@ -235,6 +242,12 @@ impl Metrics {
         family(&mut out, "mayu_tasks_deferred_total", "counter", "Rate-limited tasks handed back to the broker until their slot.");
         for ((q, t), n) in &c.deferred {
             sample(&mut out, "mayu_tasks_deferred_total", &[("queue", q), ("task", t)], n);
+        }
+        if !c.settles_stale.is_empty() {
+            family(&mut out, "mayu_settles_stale_total", "counter", "Settles ignored because another worker owns or already settled the task.");
+            for ((q, t, op), n) in &c.settles_stale {
+                sample(&mut out, "mayu_settles_stale_total", &[("queue", q), ("task", t), ("op", op)], n);
+            }
         }
         family(&mut out, "mayu_tasks_reclaimed_total", "counter", "Tasks reclaimed from workers that stopped responding.");
         for (q, n) in &c.reclaimed {
@@ -453,6 +466,18 @@ mod tests {
         m.progress_reported("q", "t");
         let b = m.render(&Gauges::default());
         assert_eq!(value(&b, r#"mayu_task_progress_reports_total{queue="q",task="t"}"#), Some(2.0));
+    }
+
+    #[test]
+    fn stale_settles_are_counted_by_op_and_only_emitted_once_seen() {
+        let m = Metrics::default();
+        assert!(!m.render(&Gauges::default()).contains("mayu_settles_stale_total"));
+        m.settle_stale("q", "t", "retry");
+        m.settle_stale("q", "t", "retry");
+        m.settle_stale("q", "t", "ack");
+        let b = m.render(&Gauges::default());
+        assert_eq!(value(&b, r#"mayu_settles_stale_total{queue="q",task="t",op="retry"}"#), Some(2.0));
+        assert_eq!(value(&b, r#"mayu_settles_stale_total{queue="q",task="t",op="ack"}"#), Some(1.0));
     }
 
     #[test]

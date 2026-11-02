@@ -255,18 +255,50 @@ fn poison_message_is_dead_lettered_without_running() {
     b.shutdown(Duration::from_secs(1));
 }
 
-#[test]
-fn lost_ownership_still_completes() {
-    let mem = MemoryBroker::default();
-    mem.push(&Header::new("t", "q", 0, "ct"), b"");
-    let a = start_as(&mem, "a", rel_cfg("a", 10_000, 5));
+/// The worker's `mayu_settles_stale_total` count for `op`, scraped from its metrics endpoint.
+fn stale_count(rt: &Runtime<MemoryBroker>, op: &str) -> f64 {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(rt.metrics_addr().unwrap()).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let mut body = String::new();
+    s.read_to_string(&mut body).unwrap();
+    let series = format!(r#"mayu_settles_stale_total{{queue="q",task="t",op="{op}"}} "#);
+    body.lines().find_map(|l| l.strip_prefix(&series)?.parse().ok()).unwrap_or(0.0)
+}
+
+/// `a` runs a task that `thief` then reclaims, as if `a` had stalled past the visibility timeout.
+fn stolen_from(mem: &MemoryBroker, max_retries: u32) -> (Runtime<MemoryBroker>, mayu_core::ReadyTask, Header) {
+    let h = Header::new("t", "q", max_retries, "ct");
+    mem.push(&h, b"");
+    let c = RuntimeConfig { metrics_addr: Some("127.0.0.1:0".parse().unwrap()), ..rel_cfg("a", 10_000, 5) };
+    let a = start_as(mem, "a", c);
     let t = a.recv_timeout(RECV).unwrap();
-    // Another worker steals the entry, as if `a` had stalled past the visibility timeout.
     let thief = mem.with_consumer("thief");
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     assert_eq!(rt.block_on(thief.reclaim("q", 0, "0-0", 10)).unwrap().deliveries.len(), 1);
+    (a, t, h)
+}
+
+#[test]
+fn lost_ownership_does_not_settle_the_new_owners_entry() {
+    let mem = MemoryBroker::default();
+    let (a, t, _) = stolen_from(&mem, 0);
     a.complete(t.token, Outcome::Success { result: None, links: vec![] });
-    wait_until(|| mem.pending_len() == 0);
+    wait_until(|| stale_count(&a, "ack") == 1.0);
+    assert_eq!(mem.pending_len(), 1, "the new owner's entry must stay pending");
+    a.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn failure_after_lost_ownership_is_counted_stale_and_not_dead_lettered() {
+    let mem = MemoryBroker::default();
+    let (a, t, h) = stolen_from(&mem, 0);
+    a.complete(t.token, Outcome::Failure { error: "E".into(), traceback: "tb".into() });
+    wait_until(|| stale_count(&a, "dead") == 1.0);
+    assert!(mem.dead().is_empty(), "a stale failure must not reach the dead letters");
+    assert!(mem.result(&h.id).is_none(), "nor store a failure result");
+    assert_eq!(mem.pending_len(), 1);
     a.shutdown(Duration::from_secs(1));
 }
 

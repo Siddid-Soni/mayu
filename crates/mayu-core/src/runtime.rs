@@ -391,9 +391,13 @@ impl<B: Broker> Runtime<B> {
             // work while stopping; give it back to the queue (as `shutdown` does for the rest).
             let f = self.inflight.lock().unwrap().remove(&task.token);
             if let Some(f) = f {
-                if let Err(e) = self.rt.block_on(self.broker.requeue(&f.delivery)) {
-                    self.metrics.broker_error("requeue");
-                    tracing::warn!(error = %e, task_id = %f.delivery.header.id, "requeue after stop failed");
+                match self.rt.block_on(self.broker.requeue(&f.delivery)) {
+                    Ok(true) => {}
+                    Ok(false) => note_stale(&self.metrics, &f.delivery, "requeue"),
+                    Err(e) => {
+                        self.metrics.broker_error("requeue");
+                        tracing::warn!(error = %e, task_id = %f.delivery.header.id, "requeue after stop failed");
+                    }
                 }
             }
             return None;
@@ -608,9 +612,13 @@ impl<B: Broker> Runtime<B> {
             for t in leftovers {
                 let f = self.inflight.lock().unwrap().remove(&t.token);
                 if let Some(f) = f {
-                    if let Err(e) = self.broker.requeue(&f.delivery).await {
-                        self.metrics.broker_error("requeue");
-                        tracing::warn!(error = %e, task_id = %f.delivery.header.id, "requeue on shutdown failed");
+                    match self.broker.requeue(&f.delivery).await {
+                        Ok(true) => {}
+                        Ok(false) => note_stale(&self.metrics, &f.delivery, "requeue"),
+                        Err(e) => {
+                            self.metrics.broker_error("requeue");
+                            tracing::warn!(error = %e, task_id = %f.delivery.header.id, "requeue on shutdown failed");
+                        }
                     }
                 }
             }
@@ -835,9 +843,13 @@ fn ack_skipped<B: Broker>(c: &FetchCtx<B>, skips: &mut JoinSet<()>, d: Delivery,
     let deadline = Duration::from_millis(c.visibility_ms);
     skips.spawn(async move {
         let rec = Record::Ack(stored, Vec::new());
-        if record_retrying(&*broker, &d, &rec, deadline, &metrics).await {
-            metrics.settled(&d.queue, &d.header.task, how, None);
-            tracing::info!(task_id = %d.header.id, task = %d.header.task, "{}", log);
+        match record_retrying(&*broker, &d, &rec, deadline, &metrics).await {
+            Some(true) => {
+                metrics.settled(&d.queue, &d.header.task, how, None);
+                tracing::info!(task_id = %d.header.id, task = %d.header.task, "{}", log);
+            }
+            Some(false) => note_stale(&metrics, &d, rec.op()),
+            None => {}
         }
         sem.add_permits(1);
     });
@@ -850,8 +862,13 @@ async fn defer<B: Broker>(c: &FetchCtx<B>, task: ReadyTask, delay: Duration) {
     let mut header = f.delivery.header.clone();
     header.eta = Some(now_ms().saturating_add(delay.as_millis() as u64));
     match c.broker.retry(&f.delivery, &header).await {
-        Ok(()) => {
+        Ok(true) => {
             c.metrics.deferred(&task.queue, &task.task);
+            c.sem.add_permits(1)
+        }
+        // Another worker owns the task now: nothing to hand back or hold, just free the slot.
+        Ok(false) => {
+            note_stale(&c.metrics, &f.delivery, "retry");
             c.sem.add_permits(1)
         }
         Err(e) => {
@@ -900,7 +917,8 @@ async fn bury_poison<B: Broker>(c: &FetchCtx<B>, d: &Delivery) {
         ttl_secs,
     });
     match c.broker.dead_letter(d, &error, stored).await {
-        Ok(()) => c.metrics.settled(&d.queue, &d.header.task, Settled::Dead, None),
+        Ok(true) => c.metrics.settled(&d.queue, &d.header.task, Settled::Dead, None),
+        Ok(false) => note_stale(&c.metrics, d, "dead"),
         Err(e) => {
             c.metrics.broker_error("dead_letter");
             tracing::error!(error = %e, task_id = %d.header.id, "failed to dead-letter poison message");
@@ -915,7 +933,25 @@ enum Record {
     Dead(String, Option<StoredResult>),
 }
 
-async fn record<B: Broker>(broker: &B, d: &Delivery, r: &Record) -> Result<()> {
+impl Record {
+    /// The settle's name in `mayu_settles_stale_total`.
+    fn op(&self) -> &'static str {
+        match self {
+            Record::Ack(..) => "ack",
+            Record::Retry(_) => "retry",
+            Record::Dead(..) => "dead",
+        }
+    }
+}
+
+/// Counts and logs a settle the broker ignored because this worker no longer owns the task.
+fn note_stale(metrics: &Metrics, d: &Delivery, op: &'static str) {
+    metrics.settle_stale(&d.queue, &d.header.task, op);
+    tracing::warn!(task_id = %d.header.id, op, "stale settle ignored: another worker owns or settled this task");
+}
+
+/// True if the broker applied the settle, false if it was stale.
+async fn record<B: Broker>(broker: &B, d: &Delivery, r: &Record) -> Result<bool> {
     match r {
         Record::Ack(stored, follow_ups) => broker.ack(d, stored.clone(), follow_ups).await,
         Record::Retry(header) => broker.retry(d, header).await,
@@ -923,14 +959,15 @@ async fn record<B: Broker>(broker: &B, d: &Delivery, r: &Record) -> Result<()> {
     }
 }
 
-/// Writes `r`, retrying with backoff while the broker errors, for at most `deadline`. False if it
-/// gave up: the message is then reclaimed and runs again.
-async fn record_retrying<B: Broker>(broker: &B, d: &Delivery, r: &Record, deadline: Duration, metrics: &Metrics) -> bool {
+/// Writes `r`, retrying with backoff while the broker errors, for at most `deadline`. `None` if it
+/// gave up: the message is then reclaimed and runs again. `Some(false)` if the write was stale.
+async fn record_retrying<B: Broker>(broker: &B, d: &Delivery, r: &Record, deadline: Duration, metrics: &Metrics)
+    -> Option<bool> {
     let began = Instant::now();
     let mut delay = Duration::from_millis(100);
     loop {
         match record(broker, d, r).await {
-            Ok(()) => return true,
+            Ok(applied) => return Some(applied),
             Err(e) if began.elapsed() + delay < deadline => {
                 metrics.broker_error("record");
                 tracing::warn!(error = %e, task_id = %d.header.id, "recording outcome failed; retrying");
@@ -941,7 +978,7 @@ async fn record_retrying<B: Broker>(broker: &B, d: &Delivery, r: &Record, deadli
                 metrics.broker_error("record");
                 tracing::error!(error = %e, task_id = %d.header.id,
                     "giving up recording outcome; the message will be reclaimed and run again");
-                return false;
+                return None;
             }
         }
     }
@@ -1021,13 +1058,17 @@ async fn completion_loop<B: Broker>(
         let (broker, metrics, sem) = (broker.clone(), metrics.clone(), sem.clone());
         let active = active.clone().filter(|_| d.header.workflow_id.is_some());
         writes.spawn(async move {
-            if record_retrying(&*broker, &d, &rec, record_deadline, &metrics).await {
-                metrics.settled(&d.queue, &d.header.task, how, started.map(|s| s.elapsed()));
-                log_settled(&d, &rec);
-                // The workflow just changed; its remaining demand with it.
-                if let Some(active) = active {
-                    active.wake.notify_one();
+            match record_retrying(&*broker, &d, &rec, record_deadline, &metrics).await {
+                Some(true) => {
+                    metrics.settled(&d.queue, &d.header.task, how, started.map(|s| s.elapsed()));
+                    log_settled(&d, &rec);
+                    // The workflow just changed; its remaining demand with it.
+                    if let Some(active) = active {
+                        active.wake.notify_one();
+                    }
                 }
+                Some(false) => note_stale(&metrics, &d, rec.op()),
+                None => {}
             }
             sem.add_permits(1);
         });

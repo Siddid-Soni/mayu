@@ -273,6 +273,11 @@ impl MemoryBroker {
     fn store(s: &mut State, r: Option<StoredResult>) {
         if let Some(r) = r { s.results.insert(r.id, r.record); }
     }
+
+    /// Whether this consumer still holds `d`'s pending entry (not reclaimed by another, not settled).
+    fn owns(&self, s: &State, d: &Delivery) -> bool {
+        matches!(s.pending.get(&d.stream_id), Some(p) if p.owner == self.consumer)
+    }
 }
 
 impl Broker for MemoryBroker {
@@ -297,7 +302,7 @@ impl Broker for MemoryBroker {
         }
     }
 
-    async fn ack(&self, d: &Delivery, result: Option<StoredResult>, follow_ups: &[(Header, Vec<u8>)]) -> Result<()> {
+    async fn ack(&self, d: &Delivery, result: Option<StoredResult>, follow_ups: &[(Header, Vec<u8>)]) -> Result<bool> {
         self.record_delay().await;
         self.check()?;
         let node = Self::workflow_node(d)?;
@@ -306,6 +311,12 @@ impl Broker for MemoryBroker {
         }
         let wake = {
             let mut s = self.state.lock().unwrap();
+            if !self.owns(&s, d) {
+                if let Some(r) = result {
+                    s.results.entry(r.id).or_insert(r.record);
+                }
+                return Ok(false);
+            }
             // First, because it is the only step that can fail and nothing has changed yet.
             let released = match node {
                 Some((wf, i)) => s.release(wf, i)?,
@@ -323,26 +334,32 @@ impl Broker for MemoryBroker {
         if wake {
             self.notify.notify_waiters();
         }
-        Ok(())
+        Ok(true)
     }
 
-    async fn retry(&self, d: &Delivery, header: &Header) -> Result<()> {
+    async fn retry(&self, d: &Delivery, header: &Header) -> Result<bool> {
         self.record_delay().await;
         self.check()?;
         if self.fail_retries.load(Ordering::SeqCst) {
             return Err(Error::Broker("injected retry failure".into()));
         }
         let mut s = self.state.lock().unwrap();
+        if !self.owns(&s, d) {
+            return Ok(false);
+        }
         s.pending.remove(&d.stream_id);
         s.delayed.entry(d.queue.clone()).or_default()
             .push((header.eta.unwrap_or(0), encode_header(header), d.payload.clone()));
-        Ok(())
+        Ok(true)
     }
 
-    async fn dead_letter(&self, d: &Delivery, error: &str, result: Option<StoredResult>) -> Result<()> {
+    async fn dead_letter(&self, d: &Delivery, error: &str, result: Option<StoredResult>) -> Result<bool> {
         self.record_delay().await;
         self.check()?;
         let mut s = self.state.lock().unwrap();
+        if !self.owns(&s, d) {
+            return Ok(false);
+        }
         s.pending.remove(&d.stream_id);
         s.dead.push(DeadEntry { queue: d.queue.clone(), header: Some(d.header.clone()), error: error.into() });
         Self::store(&mut s, result);
@@ -352,18 +369,21 @@ impl Broker for MemoryBroker {
         {
             n.state = NodeState::Dead;
         }
-        Ok(())
+        Ok(true)
     }
 
-    async fn requeue(&self, d: &Delivery) -> Result<()> {
+    async fn requeue(&self, d: &Delivery) -> Result<bool> {
         self.check()?;
         {
             let mut s = self.state.lock().unwrap();
+            if !self.owns(&s, d) {
+                return Ok(false);
+            }
             s.pending.remove(&d.stream_id);
             s.push_stream(&d.queue, d.raw_header.clone(), d.payload.clone());
         }
         self.notify.notify_waiters();
-        Ok(())
+        Ok(true)
     }
 
     async fn promote(&self, queue: &str, now_ms: u64, limit: usize) -> Result<usize> {

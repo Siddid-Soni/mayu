@@ -1,9 +1,6 @@
 //! A worker that lost a task to a reclaim must not settle it: the worker that took it over decides the outcome.
 //! Each test: A fetches, B reclaims, then A settles (stale) and, where relevant, B settles.
 //! The Redis counterparts are in `crates/mayu-redis/tests/{redis_broker,workflow}.rs`.
-//!
-//! TODO(plan 30, task 2): once `Broker::{ack, retry, dead_letter, requeue}` return `Result<bool>`, also assert
-//! `true` for owned settles and `false` for stale ones (and for a settle repeated after it applied).
 
 use mayu_core::{
     Broker, Delivery, Header, MemoryBroker, NodeState, StoredResult, WorkflowNode, WorkflowSpec, now_ms,
@@ -38,7 +35,7 @@ async fn stale_retry_leaves_the_new_owners_entry() {
     let mut next = da.header.clone();
     next.attempt = 1;
     next.eta = Some(now_ms());
-    a.retry(&da, &next).await.unwrap();
+    assert!(!a.retry(&da, &next).await.unwrap());
     let s = b.queue_stats(Q).await.unwrap();
     assert_eq!((s.pending, s.delayed), (1, 0), "stale retry must not ack B's entry or schedule a second run");
 }
@@ -47,10 +44,10 @@ async fn stale_retry_leaves_the_new_owners_entry() {
 async fn stale_dead_letter_does_not_overwrite_the_new_owners_success() {
     let (a, b, da, db) = a_lost_to_b().await;
     let id = &da.header.id;
-    a.dead_letter(&da, "boom", stored(id, "failure")).await.unwrap();
+    assert!(!a.dead_letter(&da, "boom", stored(id, "failure")).await.unwrap());
     let s = b.queue_stats(Q).await.unwrap();
     assert_eq!((s.pending, s.dead), (1, 0), "stale dead_letter must leave B's entry pending");
-    b.ack(&db, stored(id, "success"), &[]).await.unwrap();
+    assert!(b.ack(&db, stored(id, "success"), &[]).await.unwrap());
     assert_eq!(b.queue_stats(Q).await.unwrap().dead, 0, "a task B completed must not be dead-lettered");
     assert_eq!(b.get_result(id).await.unwrap(), Some(b"success".to_vec()));
 }
@@ -58,7 +55,7 @@ async fn stale_dead_letter_does_not_overwrite_the_new_owners_success() {
 #[tokio::test]
 async fn stale_requeue_adds_no_second_copy() {
     let (a, b, da, _) = a_lost_to_b().await;
-    a.requeue(&da).await.unwrap();
+    assert!(!a.requeue(&da).await.unwrap());
     let s = b.queue_stats(Q).await.unwrap();
     assert_eq!((s.stream, s.pending), (1, 1), "stale requeue must leave only B's pending entry");
     assert!(drain(&b, Q).await.is_empty(), "no second copy to fetch");
@@ -69,9 +66,9 @@ async fn stale_ack_is_overwritten_by_the_owner_and_adds_no_follow_ups() {
     let (a, b, da, db) = a_lost_to_b().await;
     let id = &da.header.id;
     let (cb_a, cb_b) = (Header::new("cb-a", "cb", 0, "ct"), Header::new("cb-b", "cb", 0, "ct"));
-    a.ack(&da, stored(id, "a"), &[(cb_a, b"a".to_vec())]).await.unwrap();
+    assert!(!a.ack(&da, stored(id, "a"), &[(cb_a, b"a".to_vec())]).await.unwrap());
     assert_eq!(b.queue_stats(Q).await.unwrap().pending, 1, "stale ack must leave B's entry pending");
-    b.ack(&db, stored(id, "b"), &[(cb_b.clone(), b"b".to_vec())]).await.unwrap();
+    assert!(b.ack(&db, stored(id, "b"), &[(cb_b.clone(), b"b".to_vec())]).await.unwrap());
     assert_eq!(b.get_result(id).await.unwrap(), Some(b"b".to_vec()));
     let follow = drain(&b, "cb").await;
     assert_eq!(follow.iter().map(|d| d.header.task.as_str()).collect::<Vec<_>>(), ["cb-b"], "added once, by B");
@@ -82,8 +79,8 @@ async fn stale_ack_after_the_owner_keeps_its_result_and_adds_no_follow_ups() {
     let (a, b, da, db) = a_lost_to_b().await;
     let id = &da.header.id;
     let (cb_a, cb_b) = (Header::new("cb-a", "cb", 0, "ct"), Header::new("cb-b", "cb", 0, "ct"));
-    b.ack(&db, stored(id, "b"), &[(cb_b, b"b".to_vec())]).await.unwrap();
-    a.ack(&da, stored(id, "a"), &[(cb_a, b"a".to_vec())]).await.unwrap();
+    assert!(b.ack(&db, stored(id, "b"), &[(cb_b, b"b".to_vec())]).await.unwrap());
+    assert!(!a.ack(&da, stored(id, "a"), &[(cb_a, b"a".to_vec())]).await.unwrap());
     assert_eq!(b.get_result(id).await.unwrap(), Some(b"b".to_vec()), "a late stale ack must not overwrite");
     let follow = drain(&b, "cb").await;
     assert_eq!(follow.iter().map(|d| d.header.task.as_str()).collect::<Vec<_>>(), ["cb-b"]);
@@ -103,13 +100,13 @@ async fn stale_ack_of_a_workflow_node_releases_nothing() {
     let da = a.fetch(&qs(), 1, 10).await.unwrap().remove(0);
     let db = b.reclaim(Q, 0, "0-0", 10).await.unwrap().deliveries.remove(0);
 
-    a.ack(&da, None, &[]).await.unwrap();
+    assert!(!a.ack(&da, None, &[]).await.unwrap());
     let st = b.workflow(&wf.id).await.unwrap().unwrap();
     let states: Vec<_> = st.nodes.iter().map(|n| n.state).collect();
     assert_eq!(states, [NodeState::Queued, NodeState::Waiting, NodeState::Waiting], "stale ack changed the node");
     assert!(drain(&b, Q).await.is_empty(), "stale ack released children");
 
-    b.ack(&db, None, &[]).await.unwrap();
+    assert!(b.ack(&db, None, &[]).await.unwrap());
     let mut children: Vec<_> = drain(&b, Q).await.into_iter().map(|d| d.header.task).collect();
     children.sort();
     assert_eq!(children, ["b", "c"], "B's ack releases the children once");
@@ -123,8 +120,8 @@ async fn retry_repeated_after_it_applied_schedules_once() {
     let mut next = d.header.clone();
     next.attempt = 1;
     next.eta = Some(now_ms() + 60_000);
-    m.retry(&d, &next).await.unwrap();
-    m.retry(&d, &next).await.unwrap(); // the first reply was lost
+    assert!(m.retry(&d, &next).await.unwrap());
+    assert!(!m.retry(&d, &next).await.unwrap()); // the first reply was lost
     assert_eq!(m.queue_stats(Q).await.unwrap().delayed, 1);
 }
 
@@ -133,8 +130,8 @@ async fn dead_letter_repeated_after_it_applied_buries_once() {
     let m = MemoryBroker::default();
     m.push(&Header::new("t", Q, 0, "ct"), b"x");
     let d = m.fetch(&qs(), 1, 10).await.unwrap().remove(0);
-    m.dead_letter(&d, "boom", None).await.unwrap();
-    m.dead_letter(&d, "boom", None).await.unwrap();
+    assert!(m.dead_letter(&d, "boom", None).await.unwrap());
+    assert!(!m.dead_letter(&d, "boom", None).await.unwrap());
     assert_eq!(m.queue_stats(Q).await.unwrap().dead, 1);
 }
 
@@ -143,7 +140,7 @@ async fn requeue_repeated_after_it_applied_adds_one_copy() {
     let m = MemoryBroker::default();
     m.push(&Header::new("t", Q, 0, "ct"), b"x");
     let d = m.fetch(&qs(), 1, 10).await.unwrap().remove(0);
-    m.requeue(&d).await.unwrap();
-    m.requeue(&d).await.unwrap();
+    assert!(m.requeue(&d).await.unwrap());
+    assert!(!m.requeue(&d).await.unwrap());
     assert_eq!(m.queue_stats(Q).await.unwrap().stream, 1);
 }
