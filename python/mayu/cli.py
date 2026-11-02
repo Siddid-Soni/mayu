@@ -24,6 +24,19 @@ def load_app(path: str) -> App:
     return obj
 
 
+def _refuse_embedded(app: App, command: str) -> bool:
+    """Prints why `command` can't reach a memory:// broker and returns True; False for any other broker."""
+    if not app._embedded:
+        return False
+    if command == "worker":
+        hint = "start the worker from the program that sends the tasks, e.g. `with app.worker(): ...`"
+    else:
+        hint = "read it from inside that program"
+    print(f"mayu: {app.broker_url} is a broker inside one Python process, so `mayu {command}` (another process) "
+          f"can't reach it; {hint} (see 'Embedded mode' in the README)", file=sys.stderr)
+    return True
+
+
 def parse_resources(text: str | None) -> dict[str, float | str] | None:
     """'gpu=1,vram_gb=7.5' -> {'gpu': 1.0, 'vram_gb': 7.5}; None or '' -> None. gpu and vram_gb also take 'auto'."""
     if not text or not text.strip():
@@ -166,6 +179,8 @@ def _cmd_worker(args) -> int:
     except (ImportError, AttributeError, ValueError, TypeError) as e:
         print(f"mayu: cannot load app {args.app!r}: {e}", file=sys.stderr)
         return 2
+    if _refuse_embedded(app, "worker"):
+        return 2
     gil = gil_enabled()
     mode = resolve_mode(args.mode, gil)
     if mode == "process" and args.threads not in (None, 1):
@@ -262,7 +277,7 @@ def _cmd_inspect(args) -> int:
     from . import admin
 
     app = _load_or_exit(args.app)
-    if app is None:
+    if app is None or _refuse_embedded(app, "inspect"):
         return 2
     queues = [q for q in args.queues.split(",") if q] if args.queues else None
     try:
@@ -281,7 +296,7 @@ def _cmd_dead(args) -> int:
         print("mayu: --limit must be >= 1", file=sys.stderr)
         return 2
     app = _load_or_exit(args.app)
-    if app is None:
+    if app is None or _refuse_embedded(app, f"dead {args.dead_cmd}"):
         return 2
     queue = args.queue or app.default_queue
     try:

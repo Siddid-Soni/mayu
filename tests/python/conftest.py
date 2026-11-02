@@ -12,6 +12,17 @@ from mayu.worker import WorkerRunner
 gpu._create_nvml = lambda: None
 
 REDIS_URL = os.environ.get("MAYU_TEST_REDIS", "redis://127.0.0.1:6390/0")
+# MAYU_TEST_BROKER=memory:// gives every `app` its own in-process broker; tests that reach Redis themselves are skipped.
+EMBEDDED = (os.environ.get("MAYU_TEST_BROKER") or "").lower() == "memory://"
+
+
+def pytest_collection_modifyitems(config, items):
+    if not EMBEDDED:
+        return
+    skip = pytest.mark.skip(reason="uses Redis directly (MAYU_TEST_BROKER=memory://)")
+    for item in items:
+        if "redis_url" in item.fixturenames:
+            item.add_marker(skip)
 
 
 @pytest.fixture
@@ -25,8 +36,9 @@ def queue():
 
 
 @pytest.fixture
-def app(redis_url, queue):
-    return App(broker=redis_url, result_ttl=60, default_queue=queue)
+def app(queue):
+    broker = f"memory://{queue}" if EMBEDDED else REDIS_URL
+    return App(broker=broker, result_ttl=60, default_queue=queue)
 
 
 @contextlib.contextmanager

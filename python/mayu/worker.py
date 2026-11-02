@@ -519,6 +519,14 @@ class WorkerRunner:
         self._supervisor.start()
         log.info("worker started", extra={"worker_id": self.worker_id, "queues": self.queues, "threads": self.threads})
 
+    def __enter__(self) -> "WorkerRunner":
+        self.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.stop()
+        self.join()
+
     def _start_native(self, rate_limits):
         return _native.Worker(
             self.app.broker_url, self.queues, self.threads, self.prefetch_multiplier, self.app.result_ttl,
