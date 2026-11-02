@@ -52,6 +52,26 @@ jobs:
           uv venv --python ${{ matrix.python }} .venv
           uv pip install --python .venv/bin/python maturin pytest msgpack opentelemetry-sdk pytest-run-parallel
           VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop --uv
+      - name: Diagnose THP arena detection
+        if: matrix.python == '3.14t'
+        run: |
+          uname -a; ldd --version | head -1; cat /sys/kernel/mm/transparent_hugepage/enabled
+          .venv/bin/python - <<'EOF'
+          import sys
+          print(sys.version)
+          obj = object(); addr = id(obj)
+          lines = open("/proc/self/smaps").read().splitlines()
+          for i, line in enumerate(lines):
+              head = line.split()[0]
+              if "-" in head and not head.endswith(":"):
+                  lo, hi = (int(x, 16) for x in head.split("-"))
+                  if lo <= addr < hi:
+                      print(f"object at {addr:#x} is in:")
+                      print(repr(line), line.split())
+                      print("\n".join(l for l in lines[i + 1:i + 30] if l.startswith(("VmFlags", "AnonHuge", "THP"))))
+          from mayu import thp
+          print("_arena_of_python_objects() ->", thp._arena_of_python_objects())
+          EOF
       - name: Test
         run: |
           case "${{ matrix.leg }}" in
