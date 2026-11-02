@@ -4,6 +4,7 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/mayu.svg)](https://pypi.org/project/mayu/)
 [![CI](https://github.com/Siddid-Soni/mayu/actions/workflows/ci.yml/badge.svg)](https://github.com/Siddid-Soni/mayu/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![XERJ Corpus Hub contributor](https://hub.xerj.org/contributors/Siddid-Soni/badge.svg)](https://hub.xerj.org/contributors/Siddid-Soni)
 
 **mayu is a fast, Redis-backed Python task queue with a Rust core, built for free-threaded
 (no-GIL) Python.** Its workers run tasks on real parallel OS threads under CPython 3.14t, so a
