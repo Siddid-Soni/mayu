@@ -14,6 +14,7 @@ log = logging.getLogger("mayu.worker")
 
 MODES = ("python", "keep", "off")
 
+_MAPS = "/proc/self/maps"
 _PR_SET_THP_DISABLE = 41
 _MADV_NOHUGEPAGE = getattr(mmap, "MADV_NOHUGEPAGE", 15)  # the value is the same on every Linux architecture
 
@@ -67,12 +68,14 @@ def _arena_of_python_objects() -> tuple[int, int] | None:
     """The anonymous writable mapping that holds a fresh object (mimalloc's arena), or None."""
     obj = object()
     addr = id(obj)
-    with open("/proc/self/maps") as f:
+    with open(_MAPS) as f:
         for line in f:
-            fields = line.split()
+            fields = line.split(maxsplit=5)
             lo, hi = (int(x, 16) for x in fields[0].split("-"))
             if lo <= addr < hi:
-                anonymous = len(fields) == 5 and fields[4] == "0"  # no path, inode 0
+                # no path, inode 0; kernels with CONFIG_ANON_VMA_NAME show mimalloc's arena as "[anon:mimalloc]"
+                unnamed = len(fields) == 5 or fields[5].startswith("[anon:")
+                anonymous = unnamed and fields[4] == "0"
                 return (lo, hi) if anonymous and "w" in fields[1] else None
     return None
 

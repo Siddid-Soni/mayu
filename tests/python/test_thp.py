@@ -68,6 +68,24 @@ def test_python_mode_advises_exactly_the_anonymous_mapping_holding_python_object
 
 
 @thread_unsafe
+@pytest.mark.parametrize(
+    "tail, found",
+    [
+        ("", True),
+        ("   [anon:mimalloc]", True),  # kernels with CONFIG_ANON_VMA_NAME (Linux 7.0 on ubuntu-26.04)
+        ("   [anon:some name]", True),
+        ("   [heap]", False),
+        ("   /usr/lib/libfoo.so", False),
+    ],
+)
+def test_arena_detection_accepts_named_anonymous_mappings_only(monkeypatch, tmp_path, tail, found):
+    maps = tmp_path / "maps"
+    maps.write_text(f"0-7fffffffffffffff rw-p 00000000 00:00 0{tail}\n")
+    monkeypatch.setattr(thp, "_MAPS", str(maps))
+    assert thp._arena_of_python_objects() == ((0, 0x7FFFFFFFFFFFFFFF) if found else None)
+
+
+@thread_unsafe
 @pytest.mark.skipif(not LINUX or FREE_THREADED, reason="GIL builds use pymalloc, which is unaffected")
 def test_python_mode_does_nothing_on_gil_builds(monkeypatch):
     libc = FakeLibc()
