@@ -10,6 +10,10 @@ All notable changes to mayu are documented here. The format follows
 
 - Task expiry: `send(..., expires=30)` (seconds from now, or a timezone-aware `datetime`) drops a task at claim time if no worker started it by the deadline, settling it as `outcome="expired"` in `mayu_tasks_settled_total` and storing a "task expired" failure (when results are enabled). `expires` is now a reserved option name. Opt-in: tasks sent without it behave exactly as before. The deadline rides in a new optional envelope field, so older workers ignore it (they won't enforce expiry); upgrade workers first.
 
+### Fixed
+
+- `--thp python` silently did nothing on kernels that name anonymous mappings (`CONFIG_ANON_VMA_NAME`, e.g. Linux 7.0 on Ubuntu 26.04), where mimalloc's arena shows as `[anon:mimalloc]` in `/proc/self/maps`: free-threaded workers were left using huge pages for Python's heap again.
+
 ## [0.2.5] - 2026-10-22
 
 ### Added
