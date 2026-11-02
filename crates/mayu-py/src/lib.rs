@@ -1,12 +1,15 @@
+mod backend;
+
 use std::collections::HashMap;
 use std::time::Duration;
+
+use backend::{Backend, Target};
 
 use mayu_core::{
     Broker, GpuStat, Header, LazyPool, Link, MoveKind, Outcome, ReadyTask, Resources, RunningTask, Runtime,
     RuntimeConfig, Schedule,
     WorkflowNode, WorkflowSpec, WorkflowState,
 };
-use mayu_redis::RedisBroker;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -68,7 +71,7 @@ type NodeArgs = (String, String, Vec<u8>, String, u32, Vec<usize>, Option<String
 #[pyclass(frozen, module = "mayu._native")]
 struct Client {
     rt: tokio::runtime::Runtime,
-    broker: RedisBroker,
+    broker: Backend,
 }
 
 fn running_task_dict<'py>(py: Python<'py>, t: RunningTask) -> PyResult<Bound<'py, PyDict>> {
@@ -131,13 +134,14 @@ fn workflow_dict<'py>(py: Python<'py>, w: WorkflowState) -> PyResult<Bound<'py, 
 impl Client {
     #[new]
     fn new(py: Python<'_>, url: String) -> PyResult<Self> {
+        let target = Target::parse(&url).map_err(core_err)?;
         py.detach(|| {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)
                 .enable_all()
                 .build()
                 .map_err(rt_err)?;
-            let broker = rt.block_on(RedisBroker::connect(&url, "producer")).map_err(rt_err)?;
+            let broker = rt.block_on(Backend::connect(target, "producer")).map_err(rt_err)?;
             Ok(Client { rt, broker })
         })
     }
@@ -271,7 +275,7 @@ impl Client {
 /// Worker-side runtime: Python threads pull tasks and report outcomes.
 #[pyclass(frozen, module = "mayu._native")]
 struct Worker {
-    inner: Runtime<RedisBroker>,
+    inner: Runtime<Backend>,
 }
 
 #[pymethods]
@@ -300,6 +304,7 @@ impl Worker {
         schedule: Option<String>,
         lookahead: bool,
     ) -> PyResult<Self> {
+        let target = Target::parse(&url).map_err(core_err)?;
         let schedule = match schedule.as_deref() {
             None => Schedule::Fifo,
             Some("throughput") => Schedule::Throughput,
@@ -341,7 +346,7 @@ impl Worker {
             );
         }
         let inner = py
-            .detach(move || Runtime::start(move || async move { RedisBroker::connect(&url, consumer).await }, cfg))
+            .detach(move || Runtime::start(move || async move { Backend::connect(target, consumer).await }, cfg))
             .map_err(rt_err)?;
         Ok(Worker { inner })
     }
