@@ -392,6 +392,20 @@ async fn replay_resets_attempt_keeps_id_and_clears_the_failure_result() {
 }
 
 #[tokio::test]
+async fn replay_starts_the_redelivery_count_over() {
+    let (b, q) = setup().await;
+    let mut h = Header::new("t", &q, 3, "ct");
+    h.redeliveries = 4; // a poison task: its crash deliveries were carried across rate-limit deferrals
+    b.enqueue(&h, b"payload").await.unwrap();
+    let d = b.fetch(&[q.clone()], 1, 100).await.unwrap().remove(0);
+    b.dead_letter(&d, "poison", None).await.unwrap();
+    let dl = b.dead_letters(&q, None, None, 10).await.unwrap();
+    assert_eq!(b.replay_dead(&q, &[dl[0].entry_id.clone()]).await.unwrap(), 1);
+    let d = b.fetch(&[q.clone()], 1, 100).await.unwrap().remove(0);
+    assert_eq!(d.header.redeliveries, 0, "a replayed task gets a fresh --max-deliveries budget");
+}
+
+#[tokio::test]
 async fn replay_twice_moves_once() {
     let (b, q) = setup().await;
     dead_one(&b, &q, 0, "e").await;

@@ -428,7 +428,7 @@ impl MemoryBroker {
         Ok(s.dead.iter().rev().find(|d| d.queue == queue).map(|d| d.entry_id.clone()))
     }
 
-    /// Moves dead letters back to `queue` to run again (attempt 0, no eta, same task id), deleting
+    /// Moves dead letters back to `queue` to run again (attempt 0, no eta, redelivery count 0, same task id), deleting
     /// their stored failure results. Missing or undecodable entries are skipped. Returns how many moved.
     pub async fn replay_dead(&self, queue: &str, entry_ids: &[String]) -> Result<usize> {
         self.check()?;
@@ -442,6 +442,7 @@ impl MemoryBroker {
                 let payload = s.dead.remove(pos).payload;
                 h.attempt = 0;
                 h.eta = None;
+                h.redeliveries = 0;
                 s.push_stream(queue, encode_header(&h), payload);
                 s.results.remove(&h.id);
                 moved += 1;

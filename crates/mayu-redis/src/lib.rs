@@ -351,7 +351,7 @@ impl RedisBroker {
         Ok(parse_range(v)?.into_iter().next().map(|(id, _)| id))
     }
 
-    /// Moves dead letters back to `queue` to run again (attempt 0, no eta, same task id), deleting
+    /// Moves dead letters back to `queue` to run again (attempt 0, no eta, redelivery count 0, same task id), deleting
     /// their stored failure results. Missing or undecodable entries are skipped. Returns how many moved.
     pub async fn replay_dead(&self, queue: &str, entry_ids: &[String]) -> Result<usize> {
         let mut picked = Vec::new();
@@ -363,6 +363,7 @@ impl RedisBroker {
             let Ok(mut h) = decode_header(&f.remove("h").unwrap_or_default()) else { continue };
             h.attempt = 0;
             h.eta = None;
+            h.redeliveries = 0;
             picked.push((entry_id, h, f.remove("p").unwrap_or_default()));
         }
         if picked.is_empty() {
