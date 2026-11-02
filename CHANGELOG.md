@@ -17,7 +17,7 @@ All notable changes to mayu are documented here. The format follows
 
 ### Fixed
 
-- Stale settles after lost ownership: the settle scripts now check that the settling worker still owns the entry. A worker that stalled past the visibility timeout and reports late no longer schedules a retry of, dead-letters, or overwrites the result of a task another worker took over and completed; a late requeue (shutdown or deferral) no longer duplicates the task; and a duplicate run's result no longer overwrites the first one's.
+- Stale settles after lost ownership: the settle scripts now check that the settling worker still owns the entry. A worker that stalled past the visibility timeout and reports late no longer schedules a retry of, dead-letters, or overwrites the result of a task another worker took over and completed; a late requeue (shutdown or deferral) no longer duplicates the task; and its late result is stored only if the task has none yet, so it never replaces the result of the worker that took over.
 - Rate-limit deferral no longer resets the redelivery count: a task that keeps crashing workers between deferrals is now dead-lettered after `--max-deliveries` deliveries, instead of never.
 
 - `--thp python` silently did nothing on kernels that name anonymous mappings (`CONFIG_ANON_VMA_NAME`, e.g. Linux 7.0 on Ubuntu 26.04), where mimalloc's arena shows as `[anon:mimalloc]` in `/proc/self/maps`: free-threaded workers were left using huge pages for Python's heap again.
