@@ -77,6 +77,8 @@ means the task runs again, never that it is lost. **Write idempotent tasks.**
   have been silent for `--visibility-timeout`.
 - A task whose worker dies `--max-deliveries` times in a row (default 5) is treated as poison
   and dead-lettered instead of being retried forever.
+- A worker that lost a task (it stalled past `--visibility-timeout` and another worker took it
+  over) can't overwrite the outcome: its late ack, retry, dead-letter or requeue is ignored.
 - Redis restarts are survived: connections reconnect, and outcomes produced while Redis is
   down are recorded when it returns. Use Redis persistence (AOF) if queued tasks must survive
   a Redis restart.
@@ -141,7 +143,7 @@ Starts are spaced evenly (no bursts). The limit is **per worker process**: with
 `--processes 4`, a `10/s` task can start 40 times a second across them. Tasks that would wait
 more than a second for their turn go back to Redis until then, so a rate-limited backlog never
 fills a worker's prefetch buffer or delays other tasks. A deferred task returns to Redis as a
-fresh entry, so its crash-redelivery count (`--max-deliveries`) starts over. Deferred tasks are
+fresh entry, but earlier crash deliveries still count towards `--max-deliveries`. Deferred tasks are
 spaced for the worker that deferred them, so adding workers doesn't speed up a backlog that is
 already deferred.
 
@@ -709,6 +711,7 @@ processes listen on 9100–9103, so scrape all four. `MAYU_METRICS_PORT` sets th
 | `mayu_task_duration_seconds` | histogram | `queue`, `task` |
 | `mayu_tasks_deferred_total` | counter | `queue`, `task` (rate-limited tasks sent back to Redis) |
 | `mayu_tasks_reclaimed_total` | counter | `queue` (taken over from a dead worker) |
+| `mayu_settles_stale_total` | counter | `queue`, `task`, `op` (`ack`, `retry`, `dead`, `requeue`; outcomes ignored because the worker had lost the task) |
 | `mayu_broker_errors_total` | counter | `op` |
 | `mayu_worker_concurrency`, `mayu_tasks_inflight`, `mayu_tasks_running` | gauge | |
 | `mayu_queue_ready`, `mayu_queue_pending`, `mayu_queue_delayed`, `mayu_queue_dead` | gauge | `queue` |

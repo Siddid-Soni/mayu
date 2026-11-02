@@ -170,6 +170,10 @@ prominently. Exactly-once is explicitly not offered.
    - retry → `XACK` + `ZADD delayed` with `attempt+1`, exponential backoff
      with full jitter
    - exhausted → `XACK` + `XADD dead`
+   - Each script first checks that the settling consumer still owns the entry
+     (it is in the PEL under that consumer). If another worker reclaimed it, the
+     script changes nothing and returns 0, and the worker counts a stale settle.
+     (A stale ack still stores its result, but only if none exists: `SET NX`.)
 6. **Recover:** each worker's reclaimer periodically runs `XAUTOCLAIM` with
    `min-idle-time = visibility_timeout` and re-executes what it claims.
 

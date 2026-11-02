@@ -9,8 +9,16 @@ All notable changes to mayu are documented here. The format follows
 ### Added
 
 - Task expiry: `send(..., expires=30)` (seconds from now, or a timezone-aware `datetime`) drops a task at claim time if no worker started it by the deadline, settling it as `outcome="expired"` in `mayu_tasks_settled_total` and storing a "task expired" failure (when results are enabled). `expires` is now a reserved option name. Opt-in: tasks sent without it behave exactly as before. The deadline rides in a new optional envelope field, so older workers ignore it (they won't enforce expiry); upgrade workers first.
+- Metric `mayu_settles_stale_total{queue,task,op}` counts outcomes a worker tried to record for a task it had lost to another worker, which are now ignored (see Fixed).
+
+### Changed
+
+- Wire (additive): the task header gains an optional `redeliveries` field, omitted when 0. Older workers ignore it (they keep resetting the count on rate-limit deferral); a task's bytes are unchanged unless it was deferred after a crash.
 
 ### Fixed
+
+- Stale settles after lost ownership: the settle scripts now check that the settling worker still owns the entry. A worker that stalled past the visibility timeout and reports late no longer schedules a retry of, dead-letters, or overwrites the result of a task another worker took over and completed; a late requeue (shutdown or deferral) no longer duplicates the task; and a duplicate run's result no longer overwrites the first one's.
+- Rate-limit deferral no longer resets the redelivery count: a task that keeps crashing workers between deferrals is now dead-lettered after `--max-deliveries` deliveries, instead of never.
 
 - `--thp python` silently did nothing on kernels that name anonymous mappings (`CONFIG_ANON_VMA_NAME`, e.g. Linux 7.0 on Ubuntu 26.04), where mimalloc's arena shows as `[anon:mimalloc]` in `/proc/self/maps`: free-threaded workers were left using huge pages for Python's heap again.
 
